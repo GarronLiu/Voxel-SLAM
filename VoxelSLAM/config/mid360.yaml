@@ -1,7 +1,14 @@
 General:
   lid_topic: "/livox/lidar"
   imu_topic: "/livox/imu"
-  save_path: "/home/zale/save_datas/"
+  gnss_ephem_topic: "/ublox_driver/ephem"
+  gnss_glo_ephem_topic: "/ublox_driver/glo_ephem"
+  gnss_meas_topic: "/ublox_driver/range_meas"
+  gnss_iono_params_topic: "/ublox_driver/iono_params"
+  navsatfix_topic: "/ublox_driver/receiver_lla"
+  receiver_pvt_topic: "/ublox_driver/receiver_pvt"
+  GNSS_enable: 1
+  save_path: "/home/garronliu/save_datas/"
   previous_map: ""
   bagname: "mid360_init"
   lidar_type: 0
@@ -40,6 +47,27 @@ LocalBA:
   plane_eigen_value_thre: [4.0, 4.0, 4.0, 4.0]
   imu_coef: 0.0002
   thread_num: 5
+
+GNSS:
+  imu_gnss_only_enable: false
+  max_delay: 0.05 #不应该超过lidar扫描周期的一半，否则可能会匹配到错误的PVT
+  gnss_local_time_diff: 18.0
+  pvt_hacc_thres: 1.0
+  pvt_vacc_thres: 2.0
+  pvt_velacc_thres: 1.0
+  pvt_min_position_std: 0.05
+  pvt_min_velocity_std: 0.05
+  pvt_iekf_max_iter: 3
+  pvt_iekf_converge_pos: 0.001
+  pvt_iekf_converge_vel: 0.001
+  psr_std_thres: 2.0
+  dopp_std_thres: 2.0
+  elevation_thres: 30.0
+  track_num_thres: 20
+  min_obs: 10
+  min_frames: 10
+  min_hor_vel: 0.3
+  navsatfix_compare_enable: 0
 
 Loop:
   jud_default: 0.45

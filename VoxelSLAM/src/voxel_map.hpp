@@ -654,6 +654,272 @@ public:
 
 };
 
+class GNSSFactor
+{
+public:
+  virtual ~GNSSFactor() {}
+
+  // Contract: external GNSS factor owns raw measurements and writes its
+  // contribution in the full LIG state order: [R,p,v,bg,ba] for every frame.
+  virtual double give_evaluate(vector<IMUST> &x_stats,
+                               Eigen::MatrixXd &jtj,
+                               Eigen::VectorXd &gg,
+                               bool jac_enable) = 0;
+
+  virtual void update_state(const Eigen::VectorXd &dxi) {}
+  virtual void rollback_state() {}
+};
+
+// The LiDAR-Inertial-GNSS BA optimizer.
+// GNSS raw measurements are managed outside and passed in as GNSSFactor.
+class LIG_BA_Optimizer
+{
+public:
+  int win_size, jac_leng, imu_leng;
+  double gnss_coef = 1.0;
+
+  void hess_plus(Eigen::MatrixXd &Hess, Eigen::VectorXd &JacT, Eigen::MatrixXd &hs, Eigen::VectorXd &js)
+  {
+    for(int i=0; i<win_size; i++)
+    {
+      JacT.block<DVEL, 1>(i*DIM, 0) += js.block<DVEL, 1>(i*DVEL, 0);
+      for(int j=0; j<win_size; j++)
+        Hess.block<DVEL, DVEL>(i*DIM, j*DIM) += hs.block<DVEL, DVEL>(i*DVEL, j*DVEL);
+    }
+  }
+
+  double add_gnss_factors(vector<IMUST> &x_stats,
+                          deque<GNSSFactor*> &gnss_factor,
+                          Eigen::MatrixXd &Hess,
+                          Eigen::VectorXd &JacT,
+                          bool jac_enable)
+  {
+    double residual = 0;
+    if(gnss_factor.empty())
+      return residual;
+
+    Eigen::MatrixXd jtj(imu_leng, imu_leng);
+    Eigen::VectorXd gg(imu_leng);
+    for(GNSSFactor *factor: gnss_factor)
+    {
+      if(factor == nullptr)
+        continue;
+
+      jtj.setZero(); gg.setZero();
+      residual += factor->give_evaluate(x_stats, jtj, gg, jac_enable);
+      if(jac_enable)
+      {
+        Hess += gnss_coef * jtj;
+        JacT += gnss_coef * gg;
+      }
+    }
+
+    return gnss_coef * residual;
+  }
+
+  double divide_thread(vector<IMUST> &x_stats,
+                       LidarFactor &voxhess,
+                       deque<IMU_PRE*> &imus_factor,
+                       deque<GNSSFactor*> &gnss_factor,
+                       Eigen::MatrixXd &Hess,
+                       Eigen::VectorXd &JacT)
+  {
+    int thd_num = 5;
+    double residual = 0;
+    Hess.setZero(); JacT.setZero();
+    PLM(-1) hessians(thd_num);
+    PLV(-1) jacobins(thd_num);
+    vector<double> resis(thd_num, 0);
+
+    for(int i=0; i<thd_num; i++)
+    {
+      hessians[i].resize(jac_leng, jac_leng);
+      jacobins[i].resize(jac_leng);
+    }
+
+    int tthd_num = thd_num;
+    int g_size = voxhess.plvec_voxels.size();
+    if(g_size < tthd_num) tthd_num = 1;
+    double part = 1.0 * g_size / tthd_num;
+
+    vector<thread*> mthreads(tthd_num);
+    for(int i=1; i<tthd_num; i++)
+      mthreads[i] = new thread(&LidarFactor::acc_evaluate2, &voxhess, x_stats, part*i, part * (i+1), ref(hessians[i]), ref(jacobins[i]), ref(resis[i]));
+
+    Eigen::MatrixXd jtj(2*DIM, 2*DIM);
+    Eigen::VectorXd gg(2*DIM);
+
+    for(int i=0; i<win_size-1; i++)
+    {
+      jtj.setZero(); gg.setZero();
+      residual += imus_factor[i]->give_evaluate(x_stats[i], x_stats[i+1], jtj, gg, true);
+      Hess.block<DIM*2, DIM*2>(i*DIM, i*DIM) += jtj;
+      JacT.block<DIM*2, 1>(i*DIM, 0) += gg;
+    }
+
+    Hess *= imu_coef;
+    JacT *= imu_coef;
+    residual *= (imu_coef * 0.5);
+
+    residual += add_gnss_factors(x_stats, gnss_factor, Hess, JacT, true);
+
+    for(int i=0; i<tthd_num; i++)
+    {
+      if(i != 0) mthreads[i]->join();
+      else
+        voxhess.acc_evaluate2(x_stats, 0, part, hessians[0], jacobins[0], resis[0]);
+      hess_plus(Hess, JacT, hessians[i], jacobins[i]);
+      residual += resis[i];
+      delete mthreads[i];
+    }
+
+    return residual;
+  }
+
+  double only_residual(vector<IMUST> &x_stats,
+                       LidarFactor &voxhess,
+                       deque<IMU_PRE*> &imus_factor,
+                       deque<GNSSFactor*> &gnss_factor)
+  {
+    double residual1 = 0, residual2 = 0;
+    Eigen::MatrixXd jtj(2*DIM, 2*DIM);
+    Eigen::VectorXd gg(2*DIM);
+
+    int thd_num = 5;
+    vector<double> residuals(thd_num, 0);
+    int g_size = voxhess.plvec_voxels.size();
+    if(g_size < thd_num)
+      thd_num = 1;
+
+    vector<thread*> mthreads(thd_num, nullptr);
+    double part = 1.0 * g_size / thd_num;
+    for(int i=1; i<thd_num; i++)
+      mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
+
+    for(int i=0; i<win_size-1; i++)
+      residual1 += imus_factor[i]->give_evaluate(x_stats[i], x_stats[i+1], jtj, gg, false);
+    residual1 *= (imu_coef * 0.5);
+
+    Eigen::MatrixXd gnss_hess(imu_leng, imu_leng);
+    Eigen::VectorXd gnss_jac(imu_leng);
+    residual1 += add_gnss_factors(x_stats, gnss_factor, gnss_hess, gnss_jac, false);
+
+    for(int i=0; i<thd_num; i++)
+    {
+      if(i != 0)
+      {
+        mthreads[i]->join(); delete mthreads[i];
+      }
+      else
+        voxhess.evaluate_only_residual(x_stats, part*i, part*(i+1), residuals[i]);
+      residual2 += residuals[i];
+    }
+
+    return (residual1 + residual2);
+  }
+
+  void damping_iter(vector<IMUST> &x_stats,
+                    LidarFactor &voxhess,
+                    deque<IMU_PRE*> &imus_factor,
+                    deque<GNSSFactor*> &gnss_factor,
+                    vector<double> &resis,
+                    Eigen::MatrixXd* hess,
+                    int max_iter = 3)
+  {
+    win_size = voxhess.win_size;
+    jac_leng = win_size * 6;
+    imu_leng = win_size * DIM;
+    double u = 0.01, v = 2;
+    Eigen::MatrixXd D(imu_leng, imu_leng), Hess(imu_leng, imu_leng);
+    Eigen::VectorXd JacT(imu_leng), dxi(imu_leng);
+    hess->resize(imu_leng, imu_leng);
+
+    D.setIdentity();
+    double residual1 = 0, residual2 = 0, q;
+    bool is_calc_hess = true;
+    vector<IMUST> x_stats_temp = x_stats;
+
+    for(int i=0; i<max_iter; i++)
+    {
+      if(is_calc_hess)
+      {
+        residual1 = divide_thread(x_stats, voxhess, imus_factor, gnss_factor, Hess, JacT);
+        *hess = Hess;
+      }
+
+      if(i == 0)
+        resis.push_back(residual1);
+
+      Hess.topRows(DIM).setZero();
+      Hess.leftCols(DIM).setZero();
+      Hess.block<DIM, DIM>(0, 0).setIdentity();
+      JacT.head(DIM).setZero();
+
+      D.diagonal() = Hess.diagonal();
+      dxi = (Hess + u*D).ldlt().solve(-JacT);
+
+      for(int j=0; j<win_size; j++)
+      {
+        x_stats_temp[j].R = x_stats[j].R * Exp(dxi.block<3, 1>(DIM*j, 0));
+        x_stats_temp[j].p = x_stats[j].p + dxi.block<3, 1>(DIM*j+3, 0);
+        x_stats_temp[j].v = x_stats[j].v + dxi.block<3, 1>(DIM*j+6, 0);
+        x_stats_temp[j].bg = x_stats[j].bg + dxi.block<3, 1>(DIM*j+9, 0);
+        x_stats_temp[j].ba = x_stats[j].ba + dxi.block<3, 1>(DIM*j+12, 0);
+      }
+
+      for(int j=0; j<win_size-1; j++)
+        imus_factor[j]->update_state(dxi.block<DIM, 1>(DIM*j, 0));
+      for(GNSSFactor *factor: gnss_factor)
+        if(factor != nullptr) factor->update_state(dxi);
+
+      double q1 = 0.5 * dxi.dot(u*D*dxi-JacT);
+      residual2 = only_residual(x_stats_temp, voxhess, imus_factor, gnss_factor);
+      q = (residual1-residual2);
+
+      if(q > 0)
+      {
+        x_stats = x_stats_temp;
+        double one_three = 1.0 / 3;
+
+        q = q / q1;
+        v = 2;
+        q = 1 - pow(2*q-1, 3);
+        u *= (q<one_three ? one_three:q);
+        is_calc_hess = true;
+      }
+      else
+      {
+        u = u * v;
+        v = 2 * v;
+        is_calc_hess = false;
+
+        for(int j=0; j<win_size-1; j++)
+        {
+          imus_factor[j]->dbg = imus_factor[j]->dbg_buf;
+          imus_factor[j]->dba = imus_factor[j]->dba_buf;
+        }
+        for(GNSSFactor *factor: gnss_factor)
+          if(factor != nullptr) factor->rollback_state();
+      }
+
+      if(fabs((residual1-residual2)/residual1)<1e-6)
+        break;
+    }
+
+    resis.push_back(residual2);
+  }
+
+  void damping_iter(vector<IMUST> &x_stats,
+                    LidarFactor &voxhess,
+                    deque<IMU_PRE*> &imus_factor,
+                    deque<GNSSFactor*> &gnss_factor,
+                    Eigen::MatrixXd* hess)
+  {
+    vector<double> resis;
+    damping_iter(x_stats, voxhess, imus_factor, gnss_factor, resis, hess);
+  }
+};
+
 // The LiDAR-Inertial BA optimizer with gravity optimization
 class LI_BA_OptimizerGravity
 {

@@ -1,6 +1,12 @@
 General:
   lid_topic: "/livox/lidar"
   imu_topic: "/livox/imu"
+  gnss_ephem_topic: "/ublox_driver/ephem"
+  gnss_glo_ephem_topic: "/ublox_driver/glo_ephem"
+  gnss_meas_topic: "/ublox_driver/range_meas"
+  gnss_iono_params_topic: "/ublox_driver/iono_params"
+  navsatfix_topic: "/ublox_driver/fix"
+  GNSS_enable: 0
   # bagname: "HKisland03"
   # bagname: "HKairport03"
   # bagname: "AMtown03"
@@ -42,6 +48,18 @@ LocalBA:
   plane_eigen_value_thre: [4.0, 4.0, 4.0, 4.0]
   imu_coef: 0.0001
   thread_num: 5
+
+GNSS:
+  max_delay: 0.05
+  psr_std_thres: 2.0
+  dopp_std_thres: 2.0
+  elevation_thres: 30.0
+  track_num_thres: 20
+  min_obs: 10
+  min_frames: 4
+  max_align_frames: 20
+  min_hor_vel: 0.3
+  navsatfix_compare_enable: 0
 
 Loop:
   jud_default: 0.40

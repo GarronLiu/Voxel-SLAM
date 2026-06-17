@@ -94,7 +94,9 @@ public:
 
       F_x.block<3,3>(0,0)  = Exp(angvel_avr, - dt);
       F_x.block<3,3>(0,9)  = -I33 * dt;
+      F_x.block<3,3>(3,0)  = -0.5 * R_imu * acc_avr_skew * dt * dt;
       F_x.block<3,3>(3,6)  = I33 * dt;
+      F_x.block<3,3>(3,12) = -0.5 * R_imu * dt * dt;
       F_x.block<3,3>(6,0)  = - R_imu * acc_avr_skew * dt;
       F_x.block<3,3>(6,12) = - R_imu * dt;
       cov_w.block<3,3>(0,0).diagonal() = cov_gyr * dt * dt;
@@ -103,6 +105,7 @@ public:
       cov_w.block<3,3>(12,12).diagonal() = cov_bias_acc * dt * dt;
 
       xc.cov = F_x * xc.cov * F_x.transpose() + cov_w;
+      xc.cov = 0.5 * (xc.cov + xc.cov.transpose());
       // R_imu = R_imu * Exp_f;
       // acc_imu = R_imu * acc_avr + xc.g;
       pos_imu = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt;
@@ -216,4 +219,3 @@ public:
 };
 
 #endif
-

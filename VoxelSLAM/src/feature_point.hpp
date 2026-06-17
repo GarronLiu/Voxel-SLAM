@@ -4,7 +4,7 @@
 #include <ros/ros.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/PointCloud2.h>
-#include <livox_ros_driver/CustomMsg.h>
+#include <livox_ros_driver2/CustomMsg.h>
 
 typedef pcl::PointXYZINormal PointType;
 using namespace std;
@@ -100,7 +100,7 @@ public:
   double blind = 1;
   double omega_l = 3610;
 
-  double process(const livox_ros_driver::CustomMsg::ConstPtr &msg, pcl::PointCloud<PointType> &pl_full)
+  double process(const livox_ros_driver2::CustomMsg::ConstPtr &msg, pcl::PointCloud<PointType> &pl_full)
   {
     livox_handler(msg, pl_full);
     return msg->header.stamp.toSec();
@@ -139,7 +139,7 @@ public:
     return t0;
   }
 
-  void livox_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg, pcl::PointCloud<PointType> &pl_full)
+  void livox_handler(const livox_ros_driver2::CustomMsg::ConstPtr &msg, pcl::PointCloud<PointType> &pl_full)
   { 
     int plsize = msg->point_num;
     pl_full.reserve(plsize);
