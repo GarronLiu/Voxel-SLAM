@@ -1767,6 +1767,7 @@ public:
 
 };
 
+// Cut the current scan into corresponding voxel in single thread
 void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<SlideWindow*> &sws)
 {
   int plsize = pvec->size();

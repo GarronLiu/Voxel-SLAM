@@ -47,6 +47,10 @@ LocalBA:
   plane_eigen_value_thre: [4.0, 4.0, 4.0, 4.0]
   imu_coef: 0.0002
   thread_num: 5
+  keyframe_enable: true
+  keyframe_dist_thresh: 0.5
+  keyframe_angle_thresh: 5.0
+  keyframe_max_interval: 10
 
 GNSS:
   imu_gnss_only_enable: false

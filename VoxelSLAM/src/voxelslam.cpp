@@ -83,7 +83,6 @@ public:
       pcl_path[i+win_base].z = pcurr[2];
     }
 
-    pub_pl_func(pcl_path, pub_curr_path);
     pub_pl_func(pcl_send, pub_cmap);
   }
 
@@ -745,6 +744,10 @@ public:
   int g_update = 0;
   int thread_num = 5;
   int degrade_bound = 10;
+  bool lba_keyframe_enable = false;
+  double lba_keyframe_dist_thresh = 0.5;
+  double lba_keyframe_angle_thresh = 5.0;
+  int lba_keyframe_max_interval = 10;
 
   vector<vector<ScanPose*>*> multimap_scanPoses;
   vector<vector<Keyframe*>*> multimap_keyframes;
@@ -758,6 +761,7 @@ public:
   vector<string> sessionNames;
   string bagname, savepath;
   int is_save_map;
+
   ros::Subscriber sub_navsat_fix;
   int GNSS_enable = 0;
   int gnss_navsatfix_enable = 0;
@@ -794,7 +798,6 @@ public:
   vector<GnssCache::ProcessedMeasurements> gnss_pending_buf;
   deque<GnssCache::ProcessedMeasurements> gnss_align_buf;
   pcl::PointCloud<PointType> gnss_fix_local_path;
-  pcl::PointCloud<PointType> gnss_spp_local_path;
 
   struct TdcpSatCache
   {
@@ -887,6 +890,10 @@ public:
     n.param<vector<double>>("LocalBA/plane_eigen_value_thre", plane_eigen_value_thre, vector<double>({1, 1, 1, 1}));
     n.param<double>("LocalBA/imu_coef", imu_coef, 1e-4);
     n.param<int>("LocalBA/thread_num", thread_num, 5);
+    n.param<bool>("LocalBA/keyframe_enable", lba_keyframe_enable, false);
+    n.param<double>("LocalBA/keyframe_dist_thresh", lba_keyframe_dist_thresh, 0.5);
+    n.param<double>("LocalBA/keyframe_angle_thresh", lba_keyframe_angle_thresh, 5.0);
+    n.param<int>("LocalBA/keyframe_max_interval", lba_keyframe_max_interval, 10);
     n.param<double>("GNSS/max_delay", gnss_max_delay, 0.05);
     n.param<double>("GNSS/gnss_local_time_diff", gnss_local_time_diff, 0.0);
     n.param<double>("GNSS/pvt_hacc_thres", gnss_pvt_hacc_thres, 1.0);
@@ -2162,6 +2169,7 @@ public:
     for(int i=0; i<imu_pre_buf.size(); i++)
       delete imu_pre_buf[i];
     x_buf.clear(); pvec_buf.clear(); imu_pre_buf.clear();
+    
     gnss_pending_buf.clear();
     gnss_align_buf.clear();
     gnss_ready = false;
@@ -2170,7 +2178,6 @@ public:
     gnss_rcv_dt.clear();
     gnss_aligned_frame_indices.clear();
     gnss_fix_local_path.clear();
-    gnss_spp_local_path.clear();
     {
       lock_guard<mutex> lock(mPvtBuf);
       gnss_pvt_buf.clear();
@@ -2179,6 +2186,7 @@ public:
     gnss_tdcp_prev_time = 0.0;
     gnss_tdcp_prev_receiver_ecef.setZero();
     gnss_tdcp_prev_sats.clear();
+    
     pl_tree->clear();
 
     for(int i=0; i<win_size; i++)
@@ -2186,6 +2194,50 @@ public:
     win_base = 0; win_count = 0; pcl_path.clear();
     pub_pl_func(pcl_path, pub_cmap);
     ROS_WARN("Reset");
+  }
+
+  void append_imu_segment(deque<sensor_msgs::Imu::Ptr> &dst,
+                          const deque<sensor_msgs::Imu::Ptr> &src)
+  {
+    if(src.empty()) return;
+    if(dst.empty())
+    {
+      dst.insert(dst.end(), src.begin(), src.end());
+      return;
+    }
+
+    double last_time = dst.back()->header.stamp.toSec();
+    for(auto it=src.begin(); it!=src.end(); ++it)
+    {
+      if((*it)->header.stamp.toSec() <= last_time)
+        continue;
+      dst.push_back(*it);
+    }
+  }
+
+  bool need_lba_keyframe(const IMUST &last_key,
+                         const IMUST &cur,
+                         int frames_since_key) const
+  {
+    if(!lba_keyframe_enable) return true;
+    double dist = (cur.p - last_key.p).norm();
+    double angle = Log(last_key.R.transpose() * cur.R).norm() * 57.3;
+    if(dist >= lba_keyframe_dist_thresh) return true;
+    if(angle >= lba_keyframe_angle_thresh) return true;
+    if(lba_keyframe_max_interval > 0 && frames_since_key >= lba_keyframe_max_interval) return true;
+    return false;
+  }
+
+  Eigen::Matrix<double, 6, 1> lio_pose_noise_from_cov(const IMUST &x_state) const
+  {
+    Eigen::Matrix<double, 6, 1> v6;
+    for(int i=0; i<6; i++)
+    {
+      double var = fabs(x_state.cov(i, i));
+      if(!std::isfinite(var)) var = 1e-4;
+      v6[i] = min(max(var, 1e-9), 10.0);
+    }
+    return v6;
   }
 
   // After local BA, update the map and marginalize the points of oldest scan
@@ -2344,6 +2396,11 @@ public:
     LidarFactor voxhess(win_size);
     const int mgsize = 1;
     Eigen::MatrixXd hess;
+    pcl::PointCloud<PointType> pcl_lba_path;
+    deque<sensor_msgs::Imu::Ptr> pending_kf_imus;
+    IMUST last_lba_keyframe;
+    bool have_lba_keyframe = false;
+    int frames_since_lba_keyframe = 0;
     while(n.ok())
     {
       if(loop_detect == 1)
@@ -2446,6 +2503,22 @@ public:
         if(init == 1)
         {
           motion_init_flag = 0;
+          pending_kf_imus.clear();
+          have_lba_keyframe = !x_buf.empty();
+          frames_since_lba_keyframe = 0;
+          pcl_lba_path.clear();
+          for(int i=0; i<win_count; i++)
+          {
+            PointType ap;
+            ap.x = x_buf[i].p[0];
+            ap.y = x_buf[i].p[1];
+            ap.z = x_buf[i].p[2];
+            ap.curvature = jour;
+            ap.intensity = sessionNames.size()-1;
+            pcl_lba_path.push_back(ap);
+          }
+          if(have_lba_keyframe)
+            last_lba_keyframe = x_buf.back();
         }
         else
         {
@@ -2458,6 +2531,8 @@ public:
       {
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
           continue;
+        append_imu_segment(pending_kf_imus, imus);
+        frames_since_lba_keyframe++;
 
         if(gnss_imu_only_enable && GNSS_enable && gnss_ready)
         {
@@ -2498,15 +2573,45 @@ public:
 
         t1 = ros::Time::now().toSec();
 
+        bool is_lba_keyframe = !have_lba_keyframe ||
+                               need_lba_keyframe(last_lba_keyframe, x_curr, frames_since_lba_keyframe);
+        if(!is_lba_keyframe)
+        {
+          ScanPose *bl_loop = new ScanPose(x_curr, pptr);
+          bl_loop->v6 = lio_pose_noise_from_cov(x_curr);
+          mtx_loop.lock();
+          buf_lba2loop.push_back(bl_loop);
+          mtx_loop.unlock();
+
+          ROS_INFO_THROTTLE(1.0,
+            "Local BA non-keyframe skipped: pending_imu=%lu frames_since_key=%d",
+            pending_kf_imus.size(), frames_since_lba_keyframe);
+          continue;
+        }
+
+        if(have_lba_keyframe && !x_buf.empty())
+        {
+          IMU_PRE *kf_imu = new IMU_PRE(x_buf.back().bg, x_buf.back().ba);
+          kf_imu->push_imu(pending_kf_imus);
+          imu_pre_buf.push_back(kf_imu);
+        }
+        pending_kf_imus.clear();
+        frames_since_lba_keyframe = 0;
+        have_lba_keyframe = true;
+        last_lba_keyframe = x_curr;
+
         win_count++;
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
         process_gnss_frame(win_count-1, x_curr);
-        if(win_count > 1)
-        {
-          imu_pre_buf.push_back(new IMU_PRE(x_buf[win_count-2].bg, x_buf[win_count-2].ba));
-          imu_pre_buf[win_count-2]->push_imu(imus);
-        }
+
+        PointType kf_path_pt;
+        kf_path_pt.x = x_curr.p[0];
+        kf_path_pt.y = x_curr.p[1];
+        kf_path_pt.z = x_curr.p[2];
+        kf_path_pt.curvature = jour;
+        kf_path_pt.intensity = sessionNames.size()-1;
+        pcl_lba_path.push_back(kf_path_pt);
         
         keyframe_loading(jour);
         voxhess.clear(); voxhess.win_size = win_size;
@@ -2522,6 +2627,10 @@ public:
         {
           degrade_cnt = 0;
           system_reset(imus);
+          pending_kf_imus.clear();
+          have_lba_keyframe = false;
+          frames_since_lba_keyframe = 0;
+          pcl_lba_path.clear();
 
           last_pos = x_curr.p; jour = 0;
 
@@ -2560,21 +2669,35 @@ public:
           LI_BA_Optimizer opt_lsv;
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
         }
+        
         update_gnss_align_cache();
         try_gnss_initialization();
 
         ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
-        bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-        for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+        if(hess.rows() >= 6 && hess.cols() >= DIM + 6)
+        {
+          bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
+          for(int i=0; i<6; i++)
+          {
+            double hc = fabs(bl->v6[i]);
+            if(!std::isfinite(hc) || hc < 1e-9) hc = 1e-9;
+            bl->v6[i] = 1.0 / hc;
+          }
+        }
+        else
+        {
+          bl->v6 = lio_pose_noise_from_cov(x_buf[0]);
+        }
         mtx_loop.lock();
         buf_lba2loop.push_back(bl);
         mtx_loop.unlock();
 
         x_curr.R = x_buf[win_count-1].R;
         x_curr.p = x_buf[win_count-1].p;
+        last_lba_keyframe = x_buf[win_count-1];
         t5 = ros::Time::now().toSec();
 
-        ResultOutput::instance().pub_localmap(mgsize, sessionNames.size()-1, pvec_buf, x_buf, pcl_path, win_base, win_count);
+        ResultOutput::instance().pub_localmap(mgsize, sessionNames.size()-1, pvec_buf, x_buf, pcl_lba_path, win_base, win_count);
 
         multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
         t6 = ros::Time::now().toSec();
