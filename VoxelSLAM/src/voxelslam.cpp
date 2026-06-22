@@ -778,6 +778,7 @@ public:
   double gnss_psr_std_thres = 2.0;
   double gnss_dopp_std_thres = 2.0;
   double gnss_elevation_thres = 30.0;
+
   uint32_t gnss_track_num_thres = 20;
   int gnss_min_obs = 10;
   int gnss_min_frames = 4;
@@ -798,6 +799,7 @@ public:
   vector<GnssCache::ProcessedMeasurements> gnss_pending_buf;
   deque<GnssCache::ProcessedMeasurements> gnss_align_buf;
   pcl::PointCloud<PointType> gnss_fix_local_path;
+  pcl::PointCloud<PointType> gnss_spp_local_path;
 
   struct TdcpSatCache
   {
@@ -907,6 +909,7 @@ public:
     n.param<double>("GNSS/psr_std_thres", gnss_psr_std_thres, 2.0);
     n.param<double>("GNSS/dopp_std_thres", gnss_dopp_std_thres, 2.0);
     n.param<double>("GNSS/elevation_thres", gnss_elevation_thres, 30.0);
+
     int gnss_track_num = 20;
     n.param<int>("GNSS/track_num_thres", gnss_track_num, 20);
     gnss_track_num_thres = static_cast<uint32_t>(max(gnss_track_num, 0));
@@ -916,7 +919,7 @@ public:
     n.param<bool>("GNSS/imu_gnss_only_enable", gnss_imu_only_enable, false);
     n.param<int>("GNSS/navsatfix_compare_enable", gnss_navsatfix_enable, 0);
     if(GNSS_enable && gnss_navsatfix_enable)
-      sub_navsat_fix = n.subscribe(navsatfix_topic, 100, &VOXEL_SLAM::navsat_fix_handler, this);
+      sub_navsat_fix = n.subscribe(gnss_pvt_topic, 100, &VOXEL_SLAM::navsat_fix_handler, this);
 
     for(double &iter: plane_eigen_value_thre) iter = 1.0 / iter;
     // for(double &iter: plane_eigen_value_thre) iter = 1.0 / iter;
@@ -981,18 +984,117 @@ public:
     if(has_gnss)
     {
       gnss_pending_buf.push_back(processed);
+      publish_gnss_spp_local_path(processed);
       ROS_INFO_THROTTLE(1.0, "GNSS matched to lidar frame %d: lidar %.6f gnss %.6f gnss_local %.6f valid_obs %lu",
                         window_index, lidar_state.t, processed.timestamp,
                         processed.timestamp - gnss_local_time_diff, processed.obs.size());
     }
   }
 
-  void navsat_fix_handler(const sensor_msgs::NavSatFixConstPtr &msg)
+  void append_synchronized_gnss_frame(const vector<gnss_comm::ObsPtr> &matched_gnss_raw,
+                                      int window_index, const IMUST &lidar_state)
+  {
+    if(!GNSS_enable || matched_gnss_raw.empty())
+      return;
+
+    Eigen::Vector3d receiver_ecef = Eigen::Vector3d::Zero();
+    if(gnss_ready)
+    {
+      Eigen::Matrix3d R_enu_local(Eigen::AngleAxisd(gnss_yaw_enu_local, Eigen::Vector3d::UnitZ()));
+      Eigen::Matrix3d R_ecef_local = gnss_R_ecef_enu * R_enu_local;
+      receiver_ecef = gnss_anchor_ecef + R_ecef_local * lidar_state.p;
+    }
+
+    GnssCache::ProcessedMeasurements processed;
+    if(!gnss_cache.prepareSynchronizedMeasurements(matched_gnss_raw,
+                                                    lidar_state.t, window_index,
+                                                    lidar_state.p, lidar_state.v,
+                                                    gnss_psr_std_thres,
+                                                    gnss_dopp_std_thres,
+                                                    gnss_track_num_thres,
+                                                    gnss_ready,
+                                                    receiver_ecef,
+                                                    gnss_elevation_thres,
+                                                    processed))
+      return;
+
+    gnss_align_buf.push_back(processed);
+    while(gnss_align_buf.size() > static_cast<size_t>(gnss_min_frames))
+      gnss_align_buf.pop_front();
+
+    publish_gnss_spp_local_path(processed);
+    ROS_INFO_THROTTLE(1.0,
+      "Synchronized GNSS appended after damping: frame %d lidar %.6f gnss %.6f valid_obs %lu",
+      window_index, lidar_state.t, processed.timestamp, processed.obs.size());
+  }
+
+  bool ecef_to_gnss_local(const Eigen::Vector3d &ecef, Eigen::Vector3d &local) const
+  {
+    if(!gnss_ready || !ecef.allFinite() || ecef.norm() < 1.0)
+      return false;
+
+    Eigen::Matrix3d R_enu_local(Eigen::AngleAxisd(gnss_yaw_enu_local, Eigen::Vector3d::UnitZ()));
+    Eigen::Matrix3d R_ecef_local = gnss_R_ecef_enu * R_enu_local;
+    local = R_ecef_local.transpose() * (ecef - gnss_anchor_ecef);
+    return local.allFinite();
+  }
+
+  void append_gnss_local_path(const Eigen::Vector3d &local,
+                              double stamp,
+                              double intensity,
+                              pcl::PointCloud<PointType> &path,
+                              ros::Publisher &pub)
+  {
+    if(!local.allFinite() || !std::isfinite(stamp) || !std::isfinite(intensity))
+      return;
+
+    PointType pt;
+    pt.x = local.x();
+    pt.y = local.y();
+    pt.z = local.z();
+    pt.intensity = intensity;
+    pt.curvature = stamp;
+    path.push_back(pt);
+    pub_pl_func(path, pub);
+  }
+
+  void publish_gnss_spp_local_path(const GnssCache::ProcessedMeasurements &processed)
+  {
+    if(!GNSS_enable || !gnss_ready || processed.obs.size() < static_cast<size_t>(gnss_min_obs))
+      return;
+
+    vector<double> iono_params = gnss_cache.latestIonoParams();
+    if(iono_params.size() != 8)
+      return;
+
+    Eigen::Matrix<double, 7, 1> spp_xyzt = gnss_comm::psr_pos(processed.obs,
+                                                               processed.ephems,
+                                                               iono_params);
+    Eigen::Vector3d spp_ecef = spp_xyzt.head<3>();
+    Eigen::Vector3d spp_local;
+    if(!ecef_to_gnss_local(spp_ecef, spp_local))
+      return;
+
+    Eigen::Vector3d diff = spp_local - processed.local_p;
+    append_gnss_local_path(spp_local,
+                           processed.timestamp - gnss_local_time_diff,
+                           diff.norm(),
+                           gnss_spp_local_path,
+                           pub_gnss_spp_local);
+
+    ROS_INFO_THROTTLE(1.0,
+      "GNSS SPP local %.3f %.3f %.3f | Lidar %.3f %.3f %.3f | diff %.3f %.3f %.3f norm %.3f",
+      spp_local.x(), spp_local.y(), spp_local.z(),
+      processed.local_p.x(), processed.local_p.y(), processed.local_p.z(),
+      diff.x(), diff.y(), diff.z(), diff.norm());
+  }
+
+  void navsat_fix_handler(const gnss_comm::GnssPVTSolnMsgConstPtr &msg)
   {
     if(!GNSS_enable || !gnss_ready)
       return;
 
-    if(msg->status.status == sensor_msgs::NavSatStatus::STATUS_NO_FIX)
+    if(!msg->valid_fix || msg->fix_type < 3)
       return;
 
     if(!std::isfinite(msg->latitude) || !std::isfinite(msg->longitude) || !std::isfinite(msg->altitude))
@@ -1000,22 +1102,19 @@ public:
 
     Eigen::Vector3d lla(msg->latitude, msg->longitude, msg->altitude);
     Eigen::Vector3d fix_ecef = gnss_comm::geo2ecef(lla);
-    Eigen::Matrix3d R_enu_local(Eigen::AngleAxisd(gnss_yaw_enu_local, Eigen::Vector3d::UnitZ()));
-    Eigen::Matrix3d R_ecef_local = gnss_R_ecef_enu * R_enu_local;
-    Eigen::Vector3d fix_local = R_ecef_local.transpose() * (fix_ecef - gnss_anchor_ecef);
+    Eigen::Vector3d fix_local;
+    if(!ecef_to_gnss_local(fix_ecef, fix_local))
+      return;
     Eigen::Vector3d diff = fix_local - x_curr.p;
 
-    PointType pt;
-    pt.x = fix_local.x();
-    pt.y = fix_local.y();
-    pt.z = fix_local.z();
-    pt.intensity = diff.norm();
-    pt.curvature = msg->header.stamp.toSec();
-    gnss_fix_local_path.push_back(pt);
-    pub_pl_func(gnss_fix_local_path, pub_gnss_fix_local);
+    append_gnss_local_path(fix_local,
+                           gnss_comm::time2sec(gnss_comm::gpst2time(msg->time.week, msg->time.tow)) - gnss_local_time_diff,
+                           diff.norm(),
+                           gnss_fix_local_path,
+                           pub_gnss_fix_local);
 
     ROS_INFO_THROTTLE(1.0,
-      "NavSatFix local %.3f %.3f %.3f | Lidar BA %.3f %.3f %.3f | diff %.3f %.3f %.3f norm %.3f",
+      "GNSS PVT local %.3f %.3f %.3f | Lidar BA %.3f %.3f %.3f | diff %.3f %.3f %.3f norm %.3f",
       fix_local.x(), fix_local.y(), fix_local.z(),
       x_curr.p.x(), x_curr.p.y(), x_curr.p.z(),
       diff.x(), diff.y(), diff.z(), diff.norm());
@@ -1054,122 +1153,42 @@ public:
   {
     if(!GNSS_enable || gnss_ready)
       return gnss_ready;
-
-    if(x_buf.empty())
-      return false;
-
-    vector<GnssCache::ProcessedMeasurements> gnss_frames;
-    vector<Eigen::Vector3d> local_ps, local_vs;
-    vector<int> frame_indices;
-    gnss_frames.reserve(gnss_align_buf.size());
-    local_ps.reserve(gnss_align_buf.size());
-    local_vs.reserve(gnss_align_buf.size());
-    frame_indices.reserve(gnss_align_buf.size());
-
-    Eigen::Vector2d avg_hor_vel(0, 0);
-    for(size_t i=0; i<gnss_align_buf.size(); i++)
+    GNSSProcess::Options options;
+    options.min_obs = gnss_min_obs;
+    options.min_frames = gnss_min_frames;
+    options.min_horizontal_velocity = gnss_min_hor_vel;
+    GNSSProcess::Result result;
+    const GNSSProcess::Status status = GNSSProcess::initialize(
+        gnss_align_buf, gnss_cache.latestIonoParams(), options, result);
+    if(status != GNSSProcess::Status::kSuccess)
     {
-      GnssCache::ProcessedMeasurements &matched = gnss_align_buf[i];
-      if(matched.obs.size() < gnss_min_obs)
-        continue;
-
-      gnss_frames.push_back(matched);
-      local_ps.push_back(matched.local_p);
-      local_vs.push_back(matched.local_v);
-      frame_indices.push_back(matched.window_index);
-      avg_hor_vel += matched.local_v.head<2>().cwiseAbs();
-    }
-
-    if(gnss_frames.size() < static_cast<size_t>(gnss_min_frames))
-      return false;
-
-    avg_hor_vel /= static_cast<double>(gnss_frames.size());
-    if(avg_hor_vel.norm() < gnss_min_hor_vel)
-    {
-      ROS_WARN_THROTTLE(5.0, "GNSS alignment waits for velocity excitation: %.3f < %.3f",
-                        avg_hor_vel.norm(), gnss_min_hor_vel);
+      if(status != GNSSProcess::Status::kInsufficientFrames)
+        ROS_WARN_THROTTLE(5.0, "%s", GNSSProcess::statusMessage(status));
       return false;
     }
 
-    vector<double> iono_params = gnss_cache.latestIonoParams();
-    if(iono_params.size() != 8)
-    {
-      ROS_WARN_THROTTLE(5.0, "GNSS alignment waits for valid ionosphere parameters.");
-      return false;
-    }
-
-    VoxelGnssInitializer initializer(gnss_frames, iono_params);
-
-    Eigen::Matrix<double, 7, 1> rough_xyzt;
-    if(!initializer.coarseLocalization(rough_xyzt))
-    {
-      ROS_WARN_THROTTLE(5.0, "GNSS coarse pseudorange localization failed.");
-      discard_oldest_gnss_align_frame();
-      return false;
-    }
-
-    double aligned_yaw = 0;
-    double aligned_rcv_ddt = 0;
-    if(!initializer.yawAlignment(local_vs, rough_xyzt.head<3>(), aligned_yaw, aligned_rcv_ddt))
-    {
-      ROS_WARN_THROTTLE(5.0, "GNSS Doppler yaw alignment failed.");
-      discard_oldest_gnss_align_frame();
-      return false;
-    }
-
-    Eigen::Matrix<double, 7, 1> refined_xyzt;
-    if(!initializer.anchorRefinement(local_ps, aligned_yaw, aligned_rcv_ddt,
-                                     rough_xyzt, refined_xyzt))
-    {
-      ROS_WARN_THROTTLE(5.0, "GNSS anchor refinement failed.");
-      discard_oldest_gnss_align_frame();
-      return false;
-    }
-
-    uint32_t observed_sys = static_cast<uint32_t>(-1);
-    for(uint32_t k=0; k<4; k++)
-    {
-      if(rough_xyzt(3+k) != 0)
-      {
-        observed_sys = k;
-        break;
-      }
-    }
-    if(observed_sys == static_cast<uint32_t>(-1))
-      return false;
-
-    gnss_rcv_dt.assign(gnss_frames.size() * 4, 0.0);
-    for(size_t i=0; i<gnss_frames.size(); i++)
-    {
-      double dt = gnss_frames[i].timestamp - gnss_frames.front().timestamp;
-      for(uint32_t k=0; k<4; k++)
-      {
-        double base_dt = rough_xyzt(3+k) == 0 ? refined_xyzt(3+observed_sys) : refined_xyzt(3+k);
-        gnss_rcv_dt[i*4+k] = base_dt + aligned_rcv_ddt * dt;
-      }
-    }
-
-    gnss_rough_xyzt = rough_xyzt;
-    gnss_refined_xyzt = refined_xyzt;
-    gnss_anchor_ecef = refined_xyzt.head<3>();
-    gnss_R_ecef_enu = gnss_comm::ecef2rotation(gnss_anchor_ecef);
-    gnss_yaw_enu_local = aligned_yaw;
-    gnss_rcv_ddt = aligned_rcv_ddt;
-    gnss_aligned_frame_indices = frame_indices;
+    gnss_rough_xyzt = result.rough_xyzt;
+    gnss_refined_xyzt = result.refined_xyzt;
+    gnss_anchor_ecef = result.anchor_ecef;
+    gnss_R_ecef_enu = result.R_ecef_enu;
+    gnss_yaw_enu_local = result.yaw_enu_local;
+    gnss_rcv_ddt = result.receiver_clock_drift;
+    gnss_rcv_dt = result.receiver_clock_biases;
+    gnss_aligned_frame_indices = result.aligned_frame_indices;
     gnss_ready = true;
 
-    ROS_INFO("GNSS initialized: anchor_ecef %.3f %.3f %.3f yaw %.3f deg span %.3f s frames %lu valid_for_BA_degeneracy_constraint",
+    // These frames were received before gnss_ready became true, so their SPP
+    // points were not published. Reproject them with the final anchor and yaw
+    // to show the complete GNSS alignment window in the SLAM local frame.
+    for(const auto &frame: result.aligned_frames)
+      publish_gnss_spp_local_path(frame);
+
+    ROS_INFO("GNSS initialized: anchor_ecef %.3f %.3f %.3f yaw %.3f deg span %.3f s frames valid_for_BA_degeneracy_constraint",
              gnss_anchor_ecef.x(), gnss_anchor_ecef.y(), gnss_anchor_ecef.z(),
              gnss_yaw_enu_local * 180.0 / M_PI,
-             gnss_frames.back().timestamp - gnss_frames.front().timestamp,
-             gnss_frames.size());
+             result.aligned_frames.back().timestamp - result.aligned_frames.front().timestamp,
+             result.aligned_frames.size());
     return true;
-  }
-
-  void discard_oldest_gnss_align_frame()
-  {
-    if(!gnss_align_buf.empty() && gnss_align_buf.size() >= static_cast<size_t>(gnss_min_frames))
-      gnss_align_buf.pop_front();
   }
 
 
@@ -2178,9 +2197,14 @@ public:
     gnss_rcv_dt.clear();
     gnss_aligned_frame_indices.clear();
     gnss_fix_local_path.clear();
+    gnss_spp_local_path.clear();
     {
       lock_guard<mutex> lock(mPvtBuf);
       gnss_pvt_buf.clear();
+    }
+    {
+      lock_guard<mutex> lock(mGnssMeasBuf);
+      gnss_meas_sync_buf.clear();
     }
     gnss_tdcp_prev_valid = false;
     gnss_tdcp_prev_time = 0.0;
@@ -2415,9 +2439,9 @@ public:
       }
 
       deque<sensor_msgs::Imu::Ptr> imus;
-      gnss_comm::PVTSolutionPtr matched_pvt;
+      vector<gnss_comm::ObsPtr> matched_gnss_raw;
       // if(!sync_packages(pcl_curr, imus, odom_ekf))
-      if(!sync_packages_append_pvt(pcl_curr, imus, odom_ekf, matched_pvt, gnss_local_time_diff, gnss_max_delay, GNSS_enable))
+      if(!sync_packages_append_GNSSRaw(pcl_curr, imus, odom_ekf, matched_gnss_raw, gnss_local_time_diff, gnss_max_delay, GNSS_enable))
       {
         if(octos_release.size() != 0)
         {
@@ -2469,20 +2493,16 @@ public:
         continue;
       }
 
-      // ── Debug: PVT matching result ──
-      if(matched_pvt)
-      {
-        double pvt_time = gnss_comm::time2sec(matched_pvt->time);
-        double pvt_utc = pvt_time - gnss_local_time_diff;
-        ROS_INFO("LIGO: PVT matched to lidar frame! pvt_utc=%.3f lidar_end=%.3f diff=%.3fms "
-                 "fix=%d carr=%d sv=%d lat=%.6f lon=%.6f h=%.2f h_acc=%.3f "
-                 "vel_n=%.2f vel_e=%.2f vel_d=%.2f",
-                 pvt_utc, odom_ekf.pcl_end_time, (pvt_utc - odom_ekf.pcl_end_time)*1000,
-                 matched_pvt->fix_type, matched_pvt->carr_soln, matched_pvt->num_sv,
-                 matched_pvt->lat, matched_pvt->lon, matched_pvt->hgt,
-                 matched_pvt->h_acc,
-                 matched_pvt->vel_n, matched_pvt->vel_e, matched_pvt->vel_d);
-      }
+      // ── Debug: raw GNSS matching result ──
+      // if(!matched_gnss_raw.empty())
+      // {
+      //   double meas_time = gnss_comm::time2sec(matched_gnss_raw.front()->time);
+      //   double meas_local_time = meas_time - gnss_local_time_diff;
+      //   ROS_INFO("Raw GNSS matched: gnss_local=%.6f lidar_end=%.6f diff=%.3fms obs=%lu",
+      //            meas_local_time, odom_ekf.pcl_end_time,
+      //            (meas_local_time - odom_ekf.pcl_end_time) * 1000.0,
+      //            matched_gnss_raw.size());
+      // }
 
       static int first_flag = 1;
       if (first_flag)
@@ -2490,6 +2510,8 @@ public:
         pcl::PointCloud<PointType> pl;
         pub_pl_func(pl, pub_pmap);
         pub_pl_func(pl, pub_prev_path);
+        pub_pl_func(pl, pub_gnss_fix_local);
+        pub_pl_func(pl, pub_gnss_spp_local);
         first_flag = 0;
       }
 
@@ -2534,20 +2556,6 @@ public:
         append_imu_segment(pending_kf_imus, imus);
         frames_since_lba_keyframe++;
 
-        if(gnss_imu_only_enable && GNSS_enable && gnss_ready)
-        {
-          static bool gnss_imu_only_logged = false;
-          if(!gnss_imu_only_logged)
-          {
-            ROS_WARN("GNSS IMU-only branch enabled: skip LiDAR update and local BA after GNSS alignment.");
-            gnss_imu_only_logged = true;
-          }
-
-          bool gnss_updated = gnss_pvt_ekf_update(x_curr, win_base + win_count);
-          ResultOutput::instance().pub_odom_func(x_curr);
-          continue;
-        }
-
         pcl::PointCloud<PointType> pl_down = *pcl_curr;
         down_sampling_voxel(pl_down, down_size);
 
@@ -2583,9 +2591,9 @@ public:
           buf_lba2loop.push_back(bl_loop);
           mtx_loop.unlock();
 
-          ROS_INFO_THROTTLE(1.0,
-            "Local BA non-keyframe skipped: pending_imu=%lu frames_since_key=%d",
-            pending_kf_imus.size(), frames_since_lba_keyframe);
+          // ROS_INFO_THROTTLE(1.0,
+          //   "Local BA non-keyframe skipped: pending_imu=%lu frames_since_key=%d",
+          //   pending_kf_imus.size(), frames_since_lba_keyframe);
           continue;
         }
 
@@ -2603,7 +2611,6 @@ public:
         win_count++;
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
-        process_gnss_frame(win_count-1, x_curr);
 
         PointType kf_path_pt;
         kf_path_pt.x = x_curr.p[0];
@@ -2649,11 +2656,11 @@ public:
       if(win_count >= win_size)
       {
         t4 = ros::Time::now().toSec();
-        if(GNSS_enable && gnss_ready)
-        {
-          ROS_WARN_THROTTLE(1.0,
-            "GNSS aligned and local BA is active: x_curr will be overwritten by optimized x_buf[win_count-1].");
-        }
+        // if(GNSS_enable && gnss_ready)
+        // {
+        //   ROS_WARN_THROTTLE(1.0,
+        //     "GNSS aligned and local BA is active: x_curr will be overwritten by optimized x_buf[win_count-1].");
+        // }
         
         if(g_update == 2)
         {
@@ -2670,7 +2677,10 @@ public:
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
         }
         
-        update_gnss_align_cache();
+        if(!matched_gnss_raw.empty())
+          append_synchronized_gnss_frame(matched_gnss_raw,
+                                         win_base + win_count - 1,
+                                         x_buf[win_count-1]);
         try_gnss_initialization();
 
         ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);

@@ -54,7 +54,7 @@ LocalBA:
 
 GNSS:
   imu_gnss_only_enable: false
-  max_delay: 0.05 #不应该超过lidar扫描周期的一半，否则可能会匹配到错误的PVT
+  max_delay: 0.01 #不应该超过lidar扫描周期的一半，否则可能会匹配到错误的PVT
   gnss_local_time_diff: 18.0
   pvt_hacc_thres: 1.0
   pvt_vacc_thres: 2.0
@@ -67,8 +67,8 @@ GNSS:
   psr_std_thres: 2.0
   dopp_std_thres: 2.0
   elevation_thres: 30.0
-  track_num_thres: 20
-  min_obs: 10
+  track_num_thres: 5
+  min_obs: 7
   min_frames: 10
   min_hor_vel: 0.3
   navsatfix_compare_enable: 0

@@ -30,6 +30,7 @@
 #include <Eigen/Sparse>
 #include <Eigen/SparseQR>
 #include "BTC.h"
+#include "GNSSProcess.h"
 
 using namespace std;
 
@@ -53,25 +54,18 @@ void pub_pl_func(T &pl, ros::Publisher &pub)
 
 mutex mBuf;
 mutex mPvtBuf;
+mutex mGnssMeasBuf;
 Features feat;
 deque<sensor_msgs::Imu::Ptr> imu_buf;
 deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
 deque<double> time_buf;
 deque<gnss_comm::PVTSolutionPtr> gnss_pvt_buf;
+deque<vector<gnss_comm::ObsPtr>> gnss_meas_sync_buf;
 
 class GnssCache
 {
 public:
-  struct ProcessedMeasurements
-  {
-    double timestamp = -1;
-    double lidar_timestamp = -1;
-    int window_index = -1;
-    Eigen::Vector3d local_p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d local_v = Eigen::Vector3d::Zero();
-    vector<gnss_comm::ObsPtr> obs;
-    vector<gnss_comm::EphemBasePtr> ephems;
-  };
+  using ProcessedMeasurements = GNSSProcess::Frame;
 
   void inputEphem(const gnss_comm::EphemBasePtr &ephem)
   {
@@ -94,6 +88,8 @@ public:
     lock_guard<mutex> lock(mtx_);
     latest_meas_time_ = gnss_comm::time2sec(meas.front()->time);
     meas_buf_.push_back(std::move(meas));
+    while(meas_buf_.size() > 200)
+      meas_buf_.pop_front();
   }
 
   bool inputIonoParams(double ts, const vector<double> &iono_params)
@@ -172,6 +168,34 @@ public:
     }
 
     return false;
+  }
+
+  bool prepareSynchronizedMeasurements(const vector<gnss_comm::ObsPtr> &meas,
+                                        double lidar_time, int window_index,
+                                        const Eigen::Vector3d &local_p,
+                                        const Eigen::Vector3d &local_v,
+                                        double psr_std_thres, double dopp_std_thres,
+                                        uint32_t track_num_thres,
+                                        bool use_elevation_filter,
+                                        const Eigen::Vector3d &receiver_ecef,
+                                        double elevation_thres_deg,
+                                        ProcessedMeasurements &processed)
+  {
+    lock_guard<mutex> lock(mtx_);
+    processed = ProcessedMeasurements();
+    if(meas.empty() || !meas.front())
+      return false;
+
+    processed.timestamp = gnss_comm::time2sec(meas.front()->time);
+    processed.lidar_timestamp = lidar_time;
+    processed.window_index = window_index;
+    processed.local_p = local_p;
+    processed.local_v = local_v;
+    filterMeasurements(meas, psr_std_thres, dopp_std_thres,
+                       track_num_thres, use_elevation_filter,
+                       receiver_ecef, elevation_thres_deg,
+                       processed.obs, processed.ephems);
+    return !processed.obs.empty();
   }
 
   size_t measurementSize()
@@ -316,204 +340,6 @@ private:
 
 GnssCache gnss_cache;
 
-class VoxelGnssInitializer
-{
-public:
-  VoxelGnssInitializer(const vector<GnssCache::ProcessedMeasurements> &gnss_frames,
-                       const vector<double> &iono_params)
-      : gnss_frames_(gnss_frames), iono_params_(iono_params)
-  {
-    num_all_meas_ = 0;
-    all_sat_states_.clear();
-    all_sat_states_.reserve(gnss_frames_.size());
-    for(const auto &frame: gnss_frames_)
-    {
-      num_all_meas_ += frame.obs.size();
-      all_sat_states_.push_back(gnss_comm::sat_states(frame.obs, frame.ephems));
-    }
-  }
-
-  bool coarseLocalization(Eigen::Matrix<double, 7, 1> &rough_xyzt)
-  {
-    rough_xyzt.setZero();
-    vector<gnss_comm::ObsPtr> accum_obs;
-    vector<gnss_comm::EphemBasePtr> accum_ephems;
-    for(const auto &frame: gnss_frames_)
-    {
-      accum_obs.insert(accum_obs.end(), frame.obs.begin(), frame.obs.end());
-      accum_ephems.insert(accum_ephems.end(), frame.ephems.begin(), frame.ephems.end());
-    }
-
-    rough_xyzt = gnss_comm::psr_pos(accum_obs, accum_ephems, iono_params_);
-    if(rough_xyzt.head<3>().norm() == 0)
-      return false;
-
-    for(uint32_t k=0; k<4; k++)
-    {
-      if(fabs(rough_xyzt(k+3)) < 1)
-        rough_xyzt(k+3) = 0;
-    }
-    return true;
-  }
-
-  bool yawAlignment(const vector<Eigen::Vector3d> &local_vs,
-                    const Eigen::Vector3d &rough_anchor_ecef,
-                    double &aligned_yaw, double &rcv_ddt)
-  {
-    if(local_vs.size() != gnss_frames_.size() || num_all_meas_ == 0)
-      return false;
-
-    aligned_yaw = 0;
-    rcv_ddt = 0;
-    double est_yaw = 0;
-    double est_rcv_ddt = 0;
-    Eigen::Matrix3d rough_R_ecef_enu = gnss_comm::ecef2rotation(rough_anchor_ecef);
-
-    uint32_t iter = 0;
-    double dx_norm = 1.0;
-    while(iter < MAX_ITERATION && dx_norm > CONVERGENCE_EPSILON)
-    {
-      Eigen::MatrixXd G(num_all_meas_, 2);
-      Eigen::VectorXd b(num_all_meas_);
-      G.setZero();
-      G.col(1).setOnes();
-      b.setZero();
-
-      Eigen::Matrix3d R_enu_local(Eigen::AngleAxisd(est_yaw, Eigen::Vector3d::UnitZ()));
-      Eigen::Matrix3d d_yaw;
-      d_yaw << -sin(est_yaw), -cos(est_yaw), 0,
-                cos(est_yaw), -sin(est_yaw), 0,
-                0,             0,            0;
-
-      uint32_t counter = 0;
-      for(uint32_t i=0; i<gnss_frames_.size(); i++)
-      {
-        Eigen::Matrix<double, 4, 1> ecef_vel_ddt;
-        ecef_vel_ddt.head<3>() = rough_R_ecef_enu * R_enu_local * local_vs[i];
-        ecef_vel_ddt(3) = est_rcv_ddt;
-
-        Eigen::VectorXd epoch_res;
-        Eigen::MatrixXd epoch_J;
-        gnss_comm::dopp_res(ecef_vel_ddt, rough_anchor_ecef, gnss_frames_[i].obs,
-                            all_sat_states_[i], epoch_res, epoch_J);
-        G.block(counter, 0, gnss_frames_[i].obs.size(), 1) =
-            epoch_J.leftCols(3) * rough_R_ecef_enu * d_yaw * local_vs[i];
-        b.segment(counter, gnss_frames_[i].obs.size()) = epoch_res;
-        counter += gnss_frames_[i].obs.size();
-      }
-
-      Eigen::Matrix2d H = G.transpose() * G;
-      Eigen::Vector2d g = G.transpose() * b;
-      Eigen::Vector2d dx = -H.ldlt().solve(g);
-      if(!dx.allFinite()) return false;
-
-      est_yaw += dx(0);
-      est_rcv_ddt += dx(1);
-      dx_norm = dx.norm();
-      iter++;
-    }
-
-    if(iter >= MAX_ITERATION && dx_norm > CONVERGENCE_EPSILON)
-      return false;
-
-    aligned_yaw = est_yaw;
-    while(aligned_yaw > M_PI) aligned_yaw -= 2.0*M_PI;
-    while(aligned_yaw < -M_PI) aligned_yaw += 2.0*M_PI;
-    rcv_ddt = est_rcv_ddt;
-    return true;
-  }
-
-  bool anchorRefinement(const vector<Eigen::Vector3d> &local_ps,
-                        double aligned_yaw, double aligned_ddt,
-                        const Eigen::Matrix<double, 7, 1> &rough_xyzt,
-                        Eigen::Matrix<double, 7, 1> &refined_xyzt)
-  {
-    if(local_ps.size() != gnss_frames_.size() || num_all_meas_ == 0)
-      return false;
-
-    refined_xyzt.setZero();
-    Eigen::Matrix3d R_enu_local(Eigen::AngleAxisd(aligned_yaw, Eigen::Vector3d::UnitZ()));
-    Eigen::Vector3d refine_anchor = rough_xyzt.head<3>();
-    Eigen::Vector4d refine_dt = rough_xyzt.tail<4>();
-
-    vector<uint32_t> unobserved_sys;
-    for(uint32_t k=0; k<4; k++)
-    {
-      if(rough_xyzt(3+k) == 0)
-        unobserved_sys.push_back(k);
-    }
-
-    uint32_t iter = 0;
-    double dx_norm = 1.0;
-    while(iter < MAX_ITERATION && dx_norm > CONVERGENCE_EPSILON)
-    {
-      Eigen::MatrixXd G(num_all_meas_ + unobserved_sys.size(), 7);
-      Eigen::VectorXd b(num_all_meas_ + unobserved_sys.size());
-      G.setZero();
-      b.setZero();
-
-      uint32_t counter = 0;
-      Eigen::Matrix3d R_ecef_enu = gnss_comm::ecef2rotation(refine_anchor);
-      Eigen::Matrix3d R_ecef_local = R_ecef_enu * R_enu_local;
-      for(uint32_t i=0; i<gnss_frames_.size(); i++)
-      {
-        Eigen::Matrix<double, 7, 1> ecef_xyz_dt;
-        ecef_xyz_dt.head<3>() = R_ecef_local * local_ps[i] + refine_anchor;
-        ecef_xyz_dt.tail<4>() = refine_dt + aligned_ddt * frameTimeDelta(i) * Eigen::Vector4d::Ones();
-
-        Eigen::VectorXd epoch_res;
-        Eigen::MatrixXd epoch_J;
-        vector<Eigen::Vector2d> atmos_delay, sv_azel;
-        gnss_comm::psr_res(ecef_xyz_dt, gnss_frames_[i].obs, all_sat_states_[i],
-                           iono_params_, epoch_res, epoch_J, atmos_delay, sv_azel);
-        G.middleRows(counter, gnss_frames_[i].obs.size()) = epoch_J;
-        b.segment(counter, gnss_frames_[i].obs.size()) = epoch_res;
-        counter += gnss_frames_[i].obs.size();
-      }
-
-      for(uint32_t k: unobserved_sys)
-      {
-        G(counter, k+3) = 1.0;
-        counter++;
-      }
-
-      Eigen::Matrix<double, 7, 7> H = G.transpose() * G;
-      Eigen::Matrix<double, 7, 1> g = G.transpose() * b;
-      Eigen::Matrix<double, 7, 1> dx = -H.ldlt().solve(g);
-      if(!dx.allFinite()) return false;
-
-      refine_anchor += dx.head<3>();
-      refine_dt += dx.tail<4>();
-      dx_norm = dx.norm();
-      iter++;
-    }
-
-    if(iter >= MAX_ITERATION && dx_norm > CONVERGENCE_EPSILON)
-      return false;
-
-    refined_xyzt.head<3>() = refine_anchor;
-    refined_xyzt.tail<4>() = refine_dt;
-    return true;
-  }
-
-private:
-  const vector<GnssCache::ProcessedMeasurements> &gnss_frames_;
-  const vector<double> &iono_params_;
-  uint32_t num_all_meas_ = 0;
-  vector<vector<gnss_comm::SatStatePtr>> all_sat_states_;
-
-  static constexpr uint32_t MAX_ITERATION = 10;
-  static constexpr double CONVERGENCE_EPSILON = 1e-5;
-
-  double frameTimeDelta(size_t frame_index) const
-  {
-    if(gnss_frames_.empty() || frame_index >= gnss_frames_.size())
-      return 0.0;
-
-    return gnss_frames_[frame_index].timestamp - gnss_frames_.front().timestamp;
-  }
-};
-
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
@@ -557,6 +383,15 @@ void gnss_glo_ephem_handler(const gnss_comm::GnssGloEphemMsgConstPtr &msg_in)
 void gnss_meas_handler(const gnss_comm::GnssMeasMsgConstPtr &msg_in)
 {
   vector<gnss_comm::ObsPtr> gnss_meas = gnss_comm::msg2meas(msg_in);
+  if(gnss_meas.empty())
+    return;
+
+  {
+    lock_guard<mutex> lock(mGnssMeasBuf);
+    gnss_meas_sync_buf.push_back(gnss_meas);
+    while(gnss_meas_sync_buf.size() > 200)
+      gnss_meas_sync_buf.pop_front();
+  }
   gnss_cache.inputMeasurements(std::move(gnss_meas));
 }
 
@@ -673,11 +508,11 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
     return false;
 }
 
-bool sync_packages_append_pvt(
+bool sync_packages_append_GNSSRaw(
     pcl::PointCloud<PointType>::Ptr &pl_ptr,
     deque<sensor_msgs::Imu::Ptr> &imus,
     IMUEKF &p_imu,
-    gnss_comm::PVTSolutionPtr &matched_pvt,
+    vector<gnss_comm::ObsPtr> &matched_gnss_raw,
     double gnss_local_time_diff, double gnss_max_delay, bool gnss_enable)
 {
   static bool pl_ready = false;
@@ -716,34 +551,33 @@ bool sync_packages_append_pvt(
     if(!pl_ready || imu_buf.empty() || imu_last_time <= p_imu.pcl_end_time) return false;
   }
 
-  // 假设GNSS PVT的时间戳已对齐到整秒，且其时间与LiDAR扫描结束时间接近（在gnss_max_delay范围内），
-  // 则将该PVT附加到当前LiDAR扫描。注意：若没有满足条件的GNSS PVT消息，处理将阻塞，
-  // 系统会暂停LiDAR-IMU融合，直到收到合格的GNSS PVT为止。
+  // GnssMeasMsg没有Header，各卫星观测属于同一历元，因此使用首个观测的GPS时间。
+  // 在原始GNSS数据尚未推进到当前LiDAR扫描附近时，等待新的测量消息到达。
   const double scan_end = max(p_imu.pcl_beg_time, p_imu.pcl_end_time);
-  const double target_pvt_utc = round(scan_end);
-  const double round_time_error = fabs(scan_end - target_pvt_utc);
+  const double target_meas_utc = round(scan_end);
+  const double round_time_error = fabs(scan_end - target_meas_utc);
   const bool lidar_end_near_round_time = round_time_error <= gnss_max_delay;
   if(gnss_enable && lidar_end_near_round_time)
   {
-    lock_guard<mutex> lock(mPvtBuf);
-    while(!gnss_pvt_buf.empty())
+    lock_guard<mutex> lock(mGnssMeasBuf);
+    while(!gnss_meas_sync_buf.empty())
     {
-      gnss_comm::PVTSolutionPtr &front_pvt = gnss_pvt_buf.front();
-      if(!front_pvt)
+      vector<gnss_comm::ObsPtr> &front_meas = gnss_meas_sync_buf.front();
+      if(front_meas.empty() || !front_meas.front())
       {
-        gnss_pvt_buf.pop_front();
+        gnss_meas_sync_buf.pop_front();
         continue;
       }
 
-      double pvt_time = gnss_comm::time2sec(front_pvt->time);
-      double pvt_utc = pvt_time - gnss_local_time_diff;
-      if(pvt_utc >= target_pvt_utc - gnss_max_delay)
+      double meas_time = gnss_comm::time2sec(front_meas.front()->time);
+      double meas_local_time = meas_time - gnss_local_time_diff;
+      if(meas_local_time >= scan_end - gnss_max_delay)
         break;
 
-      gnss_pvt_buf.pop_front();
+      gnss_meas_sync_buf.pop_front();
     }
 
-    if(gnss_pvt_buf.empty())
+    if(gnss_meas_sync_buf.empty())
       return false;
   }
 
@@ -766,34 +600,34 @@ bool sync_packages_append_pvt(
 
   pl_ready = false;
 
-  // Phase 4: attach one PVT epoch to the current LiDAR scan if available.
-  matched_pvt.reset();
+  // Attach one raw GNSS measurement epoch to the current LiDAR scan if available.
+  matched_gnss_raw.clear();
   if(gnss_enable && lidar_end_near_round_time)
   {
-    lock_guard<mutex> lock(mPvtBuf);
-    while(!gnss_pvt_buf.empty())
+    lock_guard<mutex> lock(mGnssMeasBuf);
+    while(!gnss_meas_sync_buf.empty())
     {
-      gnss_comm::PVTSolutionPtr &front_pvt = gnss_pvt_buf.front();
-      if(!front_pvt)
+      vector<gnss_comm::ObsPtr> &front_meas = gnss_meas_sync_buf.front();
+      if(front_meas.empty() || !front_meas.front())
       {
-        gnss_pvt_buf.pop_front();
+        gnss_meas_sync_buf.pop_front();
         continue;
       }
 
-      double pvt_time = gnss_comm::time2sec(front_pvt->time);
-      double pvt_utc = pvt_time - gnss_local_time_diff;
+      double meas_time = gnss_comm::time2sec(front_meas.front()->time);
+      double meas_local_time = meas_time - gnss_local_time_diff;
 
-      if(pvt_utc > target_pvt_utc + gnss_max_delay)
+      if(meas_local_time > scan_end + gnss_max_delay)
         break;
 
-      if(fabs(pvt_utc - target_pvt_utc) <= gnss_max_delay)
+      if(fabs(meas_local_time - scan_end) <= gnss_max_delay)
       {
-        matched_pvt = front_pvt;
-        gnss_pvt_buf.pop_front();
+        matched_gnss_raw = std::move(front_meas);
+        gnss_meas_sync_buf.pop_front();
         break;
       }
 
-      gnss_pvt_buf.pop_front();
+      gnss_meas_sync_buf.pop_front();
     }
   }
 

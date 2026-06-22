@@ -43,9 +43,8 @@ include_directories(
   ${GTSAM_INCLUDE_DIR}
 )
 
-add_executable(voxelslam src/voxelslam.cpp src/BTC.cpp)
+add_executable(voxelslam src/voxelslam.cpp src/BTC.cpp src/GNSSProcess.cpp)
 target_link_libraries(voxelslam ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam)
-
 
 
 
