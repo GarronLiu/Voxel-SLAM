@@ -1,7 +1,7 @@
 #ifndef LOOP_REFINE_HPP
 #define LOOP_REFINE_HPP
 
-#include "tools.hpp"
+#include "tools.h"
 #include "voxel_map.hpp"
 
 // #include "STDesc.h"

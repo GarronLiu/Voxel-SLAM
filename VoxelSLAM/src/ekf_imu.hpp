@@ -1,7 +1,7 @@
 #ifndef EKF_IMU_HPP
 #define EKF_IMU_HPP
 
-#include "tools.hpp"
+#include "tools.h"
 #include <deque>
 #include <sensor_msgs/Imu.h>
 

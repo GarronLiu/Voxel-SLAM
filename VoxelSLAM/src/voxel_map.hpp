@@ -1,7 +1,7 @@
 #ifndef VOXEL_MAP2_HPP
 #define VOXEL_MAP2_HPP
 
-#include "tools.hpp"
+#include "tools.h"
 #include "preintegration.hpp"
 #include <thread>
 #include <Eigen/Eigenvalues>

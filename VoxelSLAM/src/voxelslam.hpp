@@ -1,13 +1,20 @@
 #pragma once
 
-#include "tools.hpp"
+#include "tools.h"
 #include "ekf_imu.hpp"
 #include "voxel_map.hpp"
 #include "feature_point.hpp"
 #include "loop_refine.hpp"
+#include <algorithm>
+#include <cassert>
 #include <cmath>
+#include <deque>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <queue>
+#include <sstream>
 #include <utility>
 #include <vector>
 #include <Eigen/Eigenvalues>
@@ -20,23 +27,26 @@
 #include <nav_msgs/Odometry.h>
 #include <gnss_comm/gnss_ros.hpp>
 #include <gnss_comm/gnss_spp.hpp>
+#include <gnss_comm/gnss_utility.hpp>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <malloc.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/nonlinear/GaussNewtonOptimizer.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <Eigen/Sparse>
 #include <Eigen/SparseQR>
 #include "BTC.h"
-#include "GNSSProcess.h"
+
+#include "GNSS_Processing_fg.h"
 
 using namespace std;
 
 ros::Publisher pub_scan, pub_cmap, pub_init, pub_pmap;
 ros::Publisher pub_test, pub_prev_path, pub_curr_path;
-ros::Publisher pub_gnss_fix_local, pub_gnss_spp_local;
+ros::Publisher pub_gnss_fix_local, pub_gnss_pvt_local, pub_gnss_spp_local, pub_gnss_tc_local;
 ros::Subscriber sub_imu, sub_pcl;
 ros::Subscriber sub_gnss_ephem, sub_gnss_glo_ephem, sub_gnss_meas, sub_gnss_iono_params;
 ros::Subscriber sub_gnss_pvt;
@@ -61,284 +71,9 @@ deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
 deque<double> time_buf;
 deque<gnss_comm::PVTSolutionPtr> gnss_pvt_buf;
 deque<vector<gnss_comm::ObsPtr>> gnss_meas_sync_buf;
+queue<vector<gnss_comm::ObsPtr>> gnss_meas_buf;
 
-class GnssCache
-{
-public:
-  using ProcessedMeasurements = GNSSProcess::Frame;
-
-  void inputEphem(const gnss_comm::EphemBasePtr &ephem)
-  {
-    if(!ephem) return;
-
-    lock_guard<mutex> lock(mtx_);
-    double toe = gnss_comm::time2sec(ephem->toe);
-    if(sat2time_index_.count(ephem->sat) != 0 && sat2time_index_[ephem->sat].count(toe) != 0)
-      return;
-
-    vector<gnss_comm::EphemBasePtr> &sat_ephems = sat2ephem_[ephem->sat];
-    sat_ephems.push_back(ephem);
-    sat2time_index_[ephem->sat][toe] = sat_ephems.size() - 1;
-  }
-
-  void inputMeasurements(vector<gnss_comm::ObsPtr> meas)
-  {
-    if(meas.empty()) return;
-
-    lock_guard<mutex> lock(mtx_);
-    latest_meas_time_ = gnss_comm::time2sec(meas.front()->time);
-    meas_buf_.push_back(std::move(meas));
-    while(meas_buf_.size() > 200)
-      meas_buf_.pop_front();
-  }
-
-  bool inputIonoParams(double ts, const vector<double> &iono_params)
-  {
-    if(iono_params.size() != 8) return false;
-
-    lock_guard<mutex> lock(mtx_);
-    latest_iono_time_ = ts;
-    latest_iono_params_ = iono_params;
-    return true;
-  }
-
-  bool emptyMeasurements()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return meas_buf_.empty();
-  }
-
-  bool popFrontMeasurements(vector<gnss_comm::ObsPtr> &meas)
-  {
-    lock_guard<mutex> lock(mtx_);
-    if(meas_buf_.empty()) return false;
-
-    meas = std::move(meas_buf_.front());
-    meas_buf_.pop_front();
-    return true;
-  }
-
-  bool matchMeasurementsToLidarFrame(double lidar_time, int window_index,
-                                     const Eigen::Vector3d &local_p,
-                                     const Eigen::Vector3d &local_v,
-                                     double max_delay,
-                                     double gnss_local_time_diff,
-                                     double psr_std_thres, double dopp_std_thres,
-                                     uint32_t track_num_thres,
-                                     bool use_elevation_filter,
-                                     const Eigen::Vector3d &receiver_ecef,
-                                     double elevation_thres_deg,
-                                     ProcessedMeasurements &processed)
-  {
-    lock_guard<mutex> lock(mtx_);
-    processed = ProcessedMeasurements();
-
-    while(!meas_buf_.empty())
-    {
-      vector<gnss_comm::ObsPtr> &front_meas = meas_buf_.front();
-      if(front_meas.empty())
-      {
-        meas_buf_.pop_front();
-        continue;
-      }
-      double obs_time = gnss_comm::time2sec(front_meas.front()->time);
-      double obs_local_time = obs_time - gnss_local_time_diff;
-      if(obs_local_time > lidar_time + max_delay)
-        return false;
-
-      vector<gnss_comm::ObsPtr> valid_meas;
-      vector<gnss_comm::EphemBasePtr> valid_ephems;
-      filterMeasurements(front_meas, psr_std_thres, dopp_std_thres,
-                         track_num_thres, use_elevation_filter,
-                         receiver_ecef, elevation_thres_deg,
-                         valid_meas, valid_ephems);
-      meas_buf_.pop_front();
-
-      if(fabs(obs_local_time - lidar_time) <= max_delay && !valid_meas.empty())
-      {
-        processed.timestamp = obs_time;
-        processed.lidar_timestamp = lidar_time;
-        processed.window_index = window_index;
-        processed.local_p = local_p;
-        processed.local_v = local_v;
-        processed.obs = std::move(valid_meas);
-        processed.ephems = std::move(valid_ephems);
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  bool prepareSynchronizedMeasurements(const vector<gnss_comm::ObsPtr> &meas,
-                                        double lidar_time, int window_index,
-                                        const Eigen::Vector3d &local_p,
-                                        const Eigen::Vector3d &local_v,
-                                        double psr_std_thres, double dopp_std_thres,
-                                        uint32_t track_num_thres,
-                                        bool use_elevation_filter,
-                                        const Eigen::Vector3d &receiver_ecef,
-                                        double elevation_thres_deg,
-                                        ProcessedMeasurements &processed)
-  {
-    lock_guard<mutex> lock(mtx_);
-    processed = ProcessedMeasurements();
-    if(meas.empty() || !meas.front())
-      return false;
-
-    processed.timestamp = gnss_comm::time2sec(meas.front()->time);
-    processed.lidar_timestamp = lidar_time;
-    processed.window_index = window_index;
-    processed.local_p = local_p;
-    processed.local_v = local_v;
-    filterMeasurements(meas, psr_std_thres, dopp_std_thres,
-                       track_num_thres, use_elevation_filter,
-                       receiver_ecef, elevation_thres_deg,
-                       processed.obs, processed.ephems);
-    return !processed.obs.empty();
-  }
-
-  size_t measurementSize()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return meas_buf_.size();
-  }
-
-  size_t ephemSatelliteSize()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return sat2ephem_.size();
-  }
-
-  double latestMeasurementTime()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return latest_meas_time_;
-  }
-
-  double latestIonoTime()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return latest_iono_time_;
-  }
-
-  vector<double> latestIonoParams()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return latest_iono_params_;
-  }
-
-  deque<vector<gnss_comm::ObsPtr>> measurementSnapshot()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return meas_buf_;
-  }
-
-  map<uint32_t, vector<gnss_comm::EphemBasePtr>> ephemSnapshot()
-  {
-    lock_guard<mutex> lock(mtx_);
-    return sat2ephem_;
-  }
-
-private:
-  void filterMeasurements(const vector<gnss_comm::ObsPtr> &meas,
-                          double psr_std_thres, double dopp_std_thres,
-                          uint32_t track_num_thres,
-                          bool use_elevation_filter,
-                          const Eigen::Vector3d &receiver_ecef,
-                          double elevation_thres_deg,
-                          vector<gnss_comm::ObsPtr> &valid_meas,
-                          vector<gnss_comm::EphemBasePtr> &valid_ephems)
-  {
-    
-    for(const gnss_comm::ObsPtr &obs: meas)
-    {
-      uint32_t sys = gnss_comm::satsys(obs->sat, NULL);
-      if(sys != SYS_GPS && sys != SYS_GLO && sys != SYS_GAL && sys != SYS_BDS)
-        continue;
-
-      if(sat2ephem_.count(obs->sat) == 0 || obs->freqs.empty())
-        continue;
-
-      int freq_idx = -1;
-      gnss_comm::L1_freq(obs, &freq_idx);
-      if(freq_idx < 0) continue;
-
-      if(freq_idx >= obs->psr_std.size() || freq_idx >= obs->dopp_std.size())
-        continue;
-
-      gnss_comm::EphemBasePtr best_ephem;
-      if(!findBestEphem(obs, best_ephem))
-        continue;
-
-      if(use_elevation_filter)
-      {
-        Eigen::Vector3d sat_ecef;
-        if(sys == SYS_GLO)
-          sat_ecef = gnss_comm::geph2pos(obs->time, std::dynamic_pointer_cast<gnss_comm::GloEphem>(best_ephem), NULL);
-        else
-          sat_ecef = gnss_comm::eph2pos(obs->time, std::dynamic_pointer_cast<gnss_comm::Ephem>(best_ephem), NULL);
-
-        double azel[2] = {0, M_PI/2.0};
-        gnss_comm::sat_azel(receiver_ecef, sat_ecef, azel);
-        if(azel[1] < elevation_thres_deg * M_PI / 180.0)
-          continue;
-      }
-
-      if(obs->psr_std[freq_idx] > psr_std_thres ||
-         obs->dopp_std[freq_idx] > dopp_std_thres)
-      {
-        sat_track_status_[obs->sat] = 0;
-        continue;
-      }
-
-      sat_track_status_[obs->sat]++;
-      if(sat_track_status_[obs->sat] < track_num_thres)
-        continue;
-
-      valid_meas.push_back(obs);
-      valid_ephems.push_back(best_ephem);
-    }
-  }
-
-  bool findBestEphem(const gnss_comm::ObsPtr &obs, gnss_comm::EphemBasePtr &best_ephem)
-  {
-    if(sat2time_index_.count(obs->sat) == 0)
-      return false;
-
-    double obs_time = gnss_comm::time2sec(obs->time);
-    double ephem_time = EPH_VALID_SECONDS;
-    size_t ephem_index = 0;
-    bool found = false;
-    for(const auto &ti: sat2time_index_[obs->sat])
-    {
-      double dt = fabs(ti.first - obs_time);
-      if(dt < ephem_time)
-      {
-        ephem_time = dt;
-        ephem_index = ti.second;
-        found = true;
-      }
-    }
-
-    if(!found || ephem_time >= EPH_VALID_SECONDS)
-      return false;
-
-    best_ephem = sat2ephem_[obs->sat][ephem_index];
-    return true;
-  }
-
-  mutex mtx_;
-  deque<vector<gnss_comm::ObsPtr>> meas_buf_;
-  map<uint32_t, vector<gnss_comm::EphemBasePtr>> sat2ephem_;
-  map<uint32_t, map<double, size_t>> sat2time_index_;
-  map<uint32_t, uint32_t> sat_track_status_;
-  vector<double> latest_iono_params_;
-  double latest_meas_time_ = -1;
-  double latest_iono_time_ = -1;
-};
-
-GnssCache gnss_cache;
+std::shared_ptr<GNSSProcess> p_gnss;
 
 double imu_last_time = -1;
 int point_notime = 0;
@@ -370,14 +105,16 @@ void imu_handler(const sensor_msgs::Imu::ConstPtr &msg_in)
 
 void gnss_ephem_handler(const gnss_comm::GnssEphemMsgConstPtr &msg_in)
 {
+  if(!p_gnss || !msg_in) return;
   gnss_comm::EphemPtr ephem = gnss_comm::msg2ephem(msg_in);
-  gnss_cache.inputEphem(ephem);
+  p_gnss->p_assign->inputEphem(ephem);
 }
 
 void gnss_glo_ephem_handler(const gnss_comm::GnssGloEphemMsgConstPtr &msg_in)
 {
+  if(!p_gnss || !msg_in) return;
   gnss_comm::GloEphemPtr glo_ephem = gnss_comm::msg2glo_ephem(msg_in);
-  gnss_cache.inputEphem(glo_ephem);
+  p_gnss->p_assign->inputEphem(glo_ephem);
 }
 
 void gnss_meas_handler(const gnss_comm::GnssMeasMsgConstPtr &msg_in)
@@ -385,35 +122,32 @@ void gnss_meas_handler(const gnss_comm::GnssMeasMsgConstPtr &msg_in)
   vector<gnss_comm::ObsPtr> gnss_meas = gnss_comm::msg2meas(msg_in);
   if(gnss_meas.empty())
     return;
+  //latest_gnss_time = time2sec(gnss_meas[0]->time);
 
   {
     lock_guard<mutex> lock(mGnssMeasBuf);
     gnss_meas_sync_buf.push_back(gnss_meas);
-    while(gnss_meas_sync_buf.size() > 200)
-      gnss_meas_sync_buf.pop_front();
   }
-  gnss_cache.inputMeasurements(std::move(gnss_meas));
+  gnss_meas_buf.push(std::move(gnss_meas));
 }
 
 void gnss_pvt_handler(const gnss_comm::GnssPVTSolnMsgConstPtr &msg_in)
 {
-  gnss_comm::PVTSolutionPtr pvt = gnss_comm::msg2pvt(msg_in);
-  if(!pvt || !pvt->valid_fix)
-    return;
-  lock_guard<mutex> lock(mPvtBuf);
-  gnss_pvt_buf.push_back(pvt);
-  while(gnss_pvt_buf.size() > 200)
-    gnss_pvt_buf.pop_front();
+  if(!p_gnss || !msg_in) return;
+  double ts = time2sec(gst2time(msg_in->time.week, msg_in->time.tow));
+  p_gnss->inputpvt(ts, msg_in->latitude, msg_in->longitude, msg_in->altitude,
+                   msg_in->h_acc, msg_in->v_acc,
+                   msg_in->carr_soln, msg_in->diff_soln);
 }
 
 void gnss_iono_params_handler(const gnss_comm::StampedFloat64ArrayConstPtr &msg_in)
 {
-  vector<double> iono_params(msg_in->data.begin(), msg_in->data.end());
-  if(!gnss_cache.inputIonoParams(msg_in->header.stamp.toSec(), iono_params))
-  {
-    ROS_WARN_THROTTLE(5.0, "Ignore GNSS iono params with invalid size: %lu", msg_in->data.size());
-    return;
-  }
+    if(!p_gnss || !msg_in) return;
+    double ts = msg_in->header.stamp.toSec();
+    std::vector<double> iono_params;
+    std::copy(msg_in->data.begin(), msg_in->data.end(), std::back_inserter(iono_params));
+    assert(iono_params.size() == 8);
+    p_gnss->inputIonoParams(ts, iono_params);
 }
 
 template<class T>
@@ -554,10 +288,12 @@ bool sync_packages_append_GNSSRaw(
   // GnssMeasMsg没有Header，各卫星观测属于同一历元，因此使用首个观测的GPS时间。
   // 在原始GNSS数据尚未推进到当前LiDAR扫描附近时，等待新的测量消息到达。
   const double scan_end = max(p_imu.pcl_beg_time, p_imu.pcl_end_time);
-  const double target_meas_utc = round(scan_end);
+  const double target_meas_utc =
+    round(scan_end / p_gnss->gnss_sample_period) * p_gnss->gnss_sample_period;
   const double round_time_error = fabs(scan_end - target_meas_utc);
   const bool lidar_end_near_round_time = round_time_error <= gnss_max_delay;
   if(gnss_enable && lidar_end_near_round_time)
+    // if(gnss_enable)
   {
     lock_guard<mutex> lock(mGnssMeasBuf);
     while(!gnss_meas_sync_buf.empty())
@@ -603,6 +339,7 @@ bool sync_packages_append_GNSSRaw(
   // Attach one raw GNSS measurement epoch to the current LiDAR scan if available.
   matched_gnss_raw.clear();
   if(gnss_enable && lidar_end_near_round_time)
+  //  if(gnss_enable)
   {
     lock_guard<mutex> lock(mGnssMeasBuf);
     while(!gnss_meas_sync_buf.empty())

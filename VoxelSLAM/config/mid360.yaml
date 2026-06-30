@@ -1,13 +1,6 @@
 General:
   lid_topic: "/livox/lidar"
   imu_topic: "/livox/imu"
-  gnss_ephem_topic: "/ublox_driver/ephem"
-  gnss_glo_ephem_topic: "/ublox_driver/glo_ephem"
-  gnss_meas_topic: "/ublox_driver/range_meas"
-  gnss_iono_params_topic: "/ublox_driver/iono_params"
-  navsatfix_topic: "/ublox_driver/receiver_lla"
-  receiver_pvt_topic: "/ublox_driver/receiver_pvt"
-  GNSS_enable: 1
   save_path: "/home/garronliu/save_datas/"
   previous_map: ""
   bagname: "mid360_init"
@@ -47,31 +40,58 @@ LocalBA:
   plane_eigen_value_thre: [4.0, 4.0, 4.0, 4.0]
   imu_coef: 0.0002
   thread_num: 5
-  keyframe_enable: true
-  keyframe_dist_thresh: 0.5
-  keyframe_angle_thresh: 5.0
-  keyframe_max_interval: 10
 
 GNSS:
-  imu_gnss_only_enable: false
-  max_delay: 0.01 #不应该超过lidar扫描周期的一半，否则可能会匹配到错误的PVT
+  GNSS_enable: 1
+  gnss_ephem_topic: "/ublox_driver/ephem"
+  gnss_glo_ephem_topic: "/ublox_driver/glo_ephem"
+  gnss_meas_topic: "/ublox_driver/range_meas"
+  gnss_iono_params_topic: "/ublox_driver/iono_params"
+  gnss_pvt_topic: "/ublox_driver/receiver_pvt"
+  max_delay: 0.05 #不应该超过lidar扫描周期的一半，否则可能会匹配到错误的PVT
   gnss_local_time_diff: 18.0
   pvt_hacc_thres: 1.0
   pvt_vacc_thres: 2.0
   pvt_velacc_thres: 1.0
   pvt_min_position_std: 0.05
   pvt_min_velocity_std: 0.05
-  pvt_iekf_max_iter: 3
-  pvt_iekf_converge_pos: 0.001
-  pvt_iekf_converge_vel: 0.001
-  psr_std_thres: 2.0
+  psr_std_thres: 4.0
   dopp_std_thres: 2.0
-  elevation_thres: 30.0
-  track_num_thres: 5
-  min_obs: 7
-  min_frames: 10
+  gnss_cp_std_thres: 1.0
+  gnss_cp_time_thres: 100.0
+  gtsam_variable_thres: 30
+  gtsam_marg_variable_thres: 1
+  gnss_sample_period: 1.0
+  tight_coupling_enable: true
+  tdcp_doppler_ieskf_enable: true
+  write_back_state: false
+  pvt_loop_enable: true
+  pvt_loop_min_distance: 5.0
+  pvt_loop_time_tolerance: 0.2
+  pvt_loop_trigger_count: 10
+  pvt_recovery_time: 20.0
+  pvt_covariance_scale: 225.0
+  pvt_min_num_sv: 12
+  tc_max_correction: 30.0
+  lio_sqrt_info_min: 0.1
+  lio_sqrt_info_max: 30.0
+  lio_sqrt_info_scale: 0.0001
+  outlier_rej: true
+  outlier_thres: 1.5
+  outlier_thres_init: 10
+  window_size: 30
+  prior_noise: 10000
+  marg_noise: 0.01
+  odo_noise: 100.0
+  grav_noise: 0.09
+  psr_noise: 4.0
+  dopp_noise: 0.09
+  cp_noise: 0.0016
+  elevation_thres: 30.0  
+  min_obs: 5
+  track_num_thres: 10
   min_hor_vel: 0.3
-  navsatfix_compare_enable: 0
+  Tex_imu_r: [-0.3, 0, -0.185]
 
 Loop:
   jud_default: 0.45

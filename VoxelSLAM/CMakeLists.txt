@@ -5,10 +5,10 @@ set(CMAKE_BUILD_TYPE "Release")
 # set(CMAKE_CXX_FLAGS "-std=c++14")
 # set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 
-ADD_COMPILE_OPTIONS(-std=c++14 )
-set(CMAKE_CXX_FLAGS "-std=c++14 -O3" )
+ADD_COMPILE_OPTIONS(-std=c++14)
+set(CMAKE_CXX_FLAGS "-std=c++14 -O3")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions" )
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions")
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -27,6 +27,7 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
+find_package(Glog REQUIRED)
 # find_package(Ceres REQUIRED)
 
 catkin_package(
@@ -39,14 +40,17 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
-# ${CERES_INCLUDE_DIRS}
+  ${GLOG_INCLUDE_DIR}
+  # ${CERES_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
 )
 
-add_executable(voxelslam src/voxelslam.cpp src/BTC.cpp src/GNSSProcess.cpp)
-target_link_libraries(voxelslam ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam)
+link_directories(
+  ${catkin_LIBRARY_DIRS}
+  ${PCL_LIBRARY_DIRS}
+)
 
-
-
+add_executable(voxelslam src/voxelslam.cpp src/BTC.cpp src/tools.cpp include/GNSS_Assignment.cpp include/GNSS_Initialization.cpp include/GNSS_Processing_fg.cpp)
+target_link_libraries(voxelslam ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${GLOG_LIBRARIES} glog gtsam)
 
 
