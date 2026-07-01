@@ -111,19 +111,12 @@ class GNSSProcess
   void inputGNSSTimeDiff(const double t_diff);
   void processGNSS(const std::vector<ObsPtr> &gnss_meas, IMUST &state);
   bool GNSSLIAlign();
-  void updateGNSSStatistics(Eigen::Vector3d &pos);
   void inputpvt(double ts, double lat, double lon, double alt,
                 double h_acc, double v_acc, int float_sol, int diff_sol);
   bool matchClosestPvt(double local_timestamp, double max_time_error,
                        PvtResult &result);
-  void inputgt(double ts, double lat, double lon, double alt);
   void inputlla(double ts, double lat, double lon, double alt);
-  void processIMUOutput(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
-  void processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
   Eigen::Vector3d local2enu(Eigen::Matrix3d enu_rot, Eigen::Vector3d anc, Eigen::Vector3d &pos);
-  void SetInit();
-  bool AddFactor(gtsam::Rot3 rel_rot_, gtsam::Point3 rel_pos_, gtsam::Vector3 rel_v_, Eigen::Vector3d state_gravity, double delta_t, double time_current,
-                Eigen::Vector3d ba, Eigen::Vector3d bg,  Eigen::Vector3d pos, Eigen::Vector3d vel, Eigen::Vector3d acc, Eigen::Vector3d omg, Eigen::Matrix3d rot);
   std::map<sat_first, std::map<uint32_t, double[6]>> sat2cp; // 
   std::vector<ObsPtr> gnss_meas_buf[WINDOW_SIZE+1]; //
   std::vector<double> psr_meas_hatch_filter;
@@ -178,10 +171,6 @@ class GNSSProcess
   Eigen::Matrix3d R_ecef_enu;
   double yaw_enu_local = 0.0;
   
-  void runISAM2opt(void);
-  void GnssPsrDoppMeas(const ObsPtr &obs_, const EphemBasePtr &ephem_);
-  void SvPosCals(const ObsPtr &obs_, const EphemBasePtr &ephem_);
-  bool Evaluate(IMUST &state);
   bool prepareTdcpDopplerIeskf(const IMUST &state);
   bool buildTdcpDopplerIeskfNormal(
       const IMUST &state,
@@ -207,7 +196,6 @@ class GNSSProcess
   double odo_weight4 = 2.0;
   double odo_weight5 = 2.0;
   double odo_weight6 = 2.0;
-  IntegrationBase* pre_integration = new IntegrationBase{Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
   GNSSAssignment* p_assign = new GNSSAssignment();
   private:
     struct TdcpIeskfSatCache

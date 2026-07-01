@@ -47,6 +47,7 @@ using namespace std;
 ros::Publisher pub_scan, pub_cmap, pub_init, pub_pmap;
 ros::Publisher pub_test, pub_prev_path, pub_curr_path;
 ros::Publisher pub_gnss_fix_local, pub_gnss_pvt_local, pub_gnss_spp_local, pub_gnss_tc_local;
+ros::Publisher pub_lio_odom_enu;
 ros::Subscriber sub_imu, sub_pcl;
 ros::Subscriber sub_gnss_ephem, sub_gnss_glo_ephem, sub_gnss_meas, sub_gnss_iono_params;
 ros::Subscriber sub_gnss_pvt;

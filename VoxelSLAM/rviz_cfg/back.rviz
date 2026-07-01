@@ -9,7 +9,6 @@ Panels:
         - /Front1/current map1/Autocompute Value Bounds1
         - /init map1
         - /Image1
-        - /GNSS PVT local1
         - /PointCloud22
       Splitter Ratio: 0.5176470875740051
     Tree Height: 493
@@ -321,7 +320,7 @@ Visualization Manager:
       Size (Pixels): 5
       Size (m): 0.05000000074505806
       Style: Points
-      Topic: /map_gnss_fix_local
+      Topic: /map_gnss_pvt_local
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
@@ -410,7 +409,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 76.899658203125
+      Distance: 512.8994140625
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

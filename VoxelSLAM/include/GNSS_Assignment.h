@@ -37,7 +37,6 @@
 #pragma once
 #include <vector>
 #include <eigen3/Eigen/Dense>
-#include <gtsam/nonlinear/Marginals.h>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <Eigen/Core>
@@ -46,52 +45,12 @@
 #include "tools.h"
 #include <numeric>
 #include <opencv2/core/eigen.hpp>
-#include <gtsam/inference/Symbol.h>
-#include <gtsam/nonlinear/Values.h>
-#include <gtsam/geometry/Rot3.h>
-#include <gtsam/geometry/Pose3.h>
-#include <gtsam/geometry/Rot2.h>
-#include <gtsam/geometry/Pose2.h>
-#include <gtsam/slam/PriorFactor.h>
-#include <gtsam/slam/BetweenFactor.h>
-#include <gtsam/nonlinear/NonlinearFactorGraph.h>
-#include <gtsam/nonlinear/NonlinearEquality.h>
-#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
-#include <gtsam/nonlinear/ISAM2.h>
 #include <fstream>
+#include <queue>
 
-#include <gnss_factor/gnss_cp_factor_nor.hpp>
-// #include <gnss_factor/gnss_cp_factor_pos.hpp>
-#include <gnss_factor/gnss_lio_rel_factor.hpp>
-// #include <gnss_factor/gnss_lio_gravity_hard_factor.hpp>
-// #include <gnss_factor/gnss_lio_gravity_factor.hpp>
-#include <gnss_factor/gnss_cp_factor_nolidar.hpp>
-// #include <gnss_factor/gnss_cp_factor_nolidar_pos.hpp>
-#include <gnss_factor/gnss_ddt_smooth_factor.hpp>
-#include <gnss_factor/gnss_dt_ddt_factor.hpp>
-#include <gnss_factor/gnss_lio_factor.hpp>
-#include <gnss_factor/gnss_lio_factor_nolidar.hpp>
-#include <gnss_factor/gnss_prior_factor.hpp>
-#include <gnss_factor/gnss_psr_dopp_factor_nor.hpp>
-// #include <gnss_factor/gnss_psr_dopp_factor_pos.hpp>
-#include <gnss_factor/gnss_psr_dopp_factor_nolidar.hpp>
-// #include <gnss_factor/gnss_psr_dopp_factor_nolidar_pos.hpp>
 
 using namespace gnss_comm;
 
-using gtsam::symbol_shorthand::R; // Pose3 ()
-using gtsam::symbol_shorthand::P; // Pose3 (x,y,z,r,p,y)
-// using gtsam::symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
-using gtsam::symbol_shorthand::B; // clock drift (dt_g,dt_r,dt_e,dt_c)
-using gtsam::symbol_shorthand::C; // rate of clock drift  (ddt)
-using gtsam::symbol_shorthand::E; // ext_p
-using gtsam::symbol_shorthand::F; // pos, vel and imu bias (vel ba bg)
-using gtsam::symbol_shorthand::A; // pos, vel
-using gtsam::symbol_shorthand::O; // pos, vel
-using gtsam::symbol_shorthand::G; // pos, vel
-// using gtsam::symbol_shorthand::G; // ext_R
-// using gtsam::symbol_shorthand::Y; // local enu (yaw)
-// using gtsam::symbol_shorthand::A; // anchor point (anc) total = 18 dimensions
 
 struct sat_first
 {
@@ -114,12 +73,6 @@ class GNSSAssignment
         ~GNSSAssignment() {};
         // ofstream fout_std;
 
-        // use GTSAM
-        gtsam::NonlinearFactorGraph gtSAMgraph; // store factors //
-        gtsam::Values initialEstimate; // store initial values of the node //
-
-        gtsam::Values isamCurrentEstimate; // 
-        gtsam::ISAM2 isam;
 
         double prior_noise = 0.01;
         double marg_noise = 0.01;
@@ -140,38 +93,6 @@ class GNSSAssignment
         double outlier_thres_init = 10;
         uint32_t gnss_track_num_threshold = 0;
         int process_feat_num = 0;
-
-        gtsam::noiseModel::Base::shared_ptr margrotNoise;
-        gtsam::noiseModel::Base::shared_ptr margposNoise;
-        // gtsam::noiseModel::Diagonal::shared_ptr priorvelNoise;
-        gtsam::noiseModel::Base::shared_ptr margNoise;
-        gtsam::noiseModel::Base::shared_ptr margdtNoise;
-        gtsam::noiseModel::Base::shared_ptr margddtNoise;
-
-        gtsam::noiseModel::Base::shared_ptr priorrotNoise;
-        gtsam::noiseModel::Base::shared_ptr priorposNoise;
-        gtsam::noiseModel::Base::shared_ptr priorextrotNoise;
-        gtsam::noiseModel::Base::shared_ptr priorNoise;
-        gtsam::noiseModel::Base::shared_ptr priorBiasNoise;
-        gtsam::noiseModel::Base::shared_ptr priorGravNoise;
-        gtsam::noiseModel::Base::shared_ptr priordtNoise;
-        gtsam::noiseModel::Base::shared_ptr priorextposNoise;
-        gtsam::noiseModel::Base::shared_ptr dtNoise;
-        gtsam::noiseModel::Base::shared_ptr dtNoise_init;
-        gtsam::noiseModel::Base::shared_ptr priorddtNoise;
-        gtsam::noiseModel::Base::shared_ptr ddtNoise;
-        gtsam::noiseModel::Base::shared_ptr ddtNoise_init;
-        gtsam::noiseModel::Base::shared_ptr odomNoise;
-        gtsam::noiseModel::Base::shared_ptr odomaNoise;
-        // gtsam::noiseModel::Diagonal::shared_ptr odomNoiseIMU;
-        gtsam::noiseModel::Base::shared_ptr odomNoiseIMU;
-        gtsam::noiseModel::Base::shared_ptr robustpsrdoppNoise;
-        gtsam::noiseModel::Base::shared_ptr robustpsrdoppNoise_init;
-        gtsam::noiseModel::Base::shared_ptr robustcpNoise;
-        gtsam::noiseModel::Base::shared_ptr robustcpNoise_init;
-        gtsam::noiseModel::Base::shared_ptr adapNoise;
-        // gtsam::noiseModel::Gaussian::shared_ptr testNoise;
-        void initNoises(void); 
 
         int marg_thred = 1;
         int change_ext = 1;
@@ -201,7 +122,4 @@ class GNSSAssignment
         std::map<uint32_t, double> last_cp_meas; //
         double gnss_elevation_threshold = 30;
         void processGNSSBase(const std::vector<ObsPtr> &gnss_meas, std::vector<double> &psr_meas, std::vector<ObsPtr> &valid_meas, std::vector<EphemBasePtr> &valid_ephems, bool gnss_ready, Eigen::Vector3d ecef_pos, double last_gnss_time_process);
-        void delete_variables(bool nolidar, size_t frame_delete, int frame_num, size_t &id_accumulate, gtsam::FactorIndices delete_factor);
-
-        double str2double(const std::string &num_str);
 };

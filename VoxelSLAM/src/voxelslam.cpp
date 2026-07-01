@@ -761,8 +761,6 @@ public:
   string bagname, savepath;
   int is_save_map;
 
-  bool nolidar;
-
   ros::Subscriber sub_navsat_fix;
   int GNSS_enable = 0;
 
@@ -795,11 +793,19 @@ public:
   double gnss_lio_sqrt_info_scale = 1.0;
   bool gnss_tight_coupling_enable = false;
   bool gnss_tdcp_doppler_ieskf_enable = false;
-  bool gnss_write_back_state = false;
   bool gnss_pvt_loop_enable = true;
   double gnss_pvt_loop_min_distance = 5.0;
   double gnss_pvt_loop_time_tolerance = 0.2;
   int gnss_pvt_loop_trigger_count = 3;
+  bool gnss_pvt_robust_kernel_enable = true;
+  double gnss_pvt_huber_threshold = 2.5;
+  int gnss_pvt_alignment_min_samples = 20;
+  int gnss_pvt_alignment_max_samples = 500;
+  double gnss_pvt_alignment_min_baseline = 10.0;
+  double gnss_pvt_alignment_max_rms = 3.0;
+  double gnss_pvt_alignment_rotation_prior_std = 0.35;
+  double gnss_pvt_alignment_translation_prior_std = 100.0;
+  double gnss_pvt_alignment_lever_prior_std = 1.0;
   bool gnss_ready = false;
   bool gnss_candidate_initialized = false;
   bool gnss_candidate_valid = false;
@@ -826,13 +832,42 @@ public:
     int session_id = -1;
     int pose_id = -1;
   };
-  struct PendingPvtMatch
+  struct RawLoopPvtMeasurement
   {
     double timestamp = -1.0;
-    Eigen::Matrix3d body_rotation = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d ecef = Eigen::Vector3d::Zero();
+    Eigen::Vector3d variances = Eigen::Vector3d::Ones();
   };
-  deque<PendingPvtMatch> pending_pvt_matches;
-  deque<LoopPvtConstraint> pending_pvt_loop_constraints;
+  struct PvtAlignmentSample
+  {
+    double timestamp = -1.0;
+    double time_error = std::numeric_limits<double>::infinity();
+    Eigen::Vector3d lidar_position = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d lidar_rotation = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d pvt_enu = Eigen::Vector3d::Zero();
+    Eigen::Vector3d variances = Eigen::Vector3d::Ones();
+    int session_id = -1;
+    int pose_id = -1;
+  };
+  deque<RawLoopPvtMeasurement> raw_pvt_loop_measurements;
+  deque<PvtAlignmentSample> pvt_alignment_samples;
+  bool pvt_alignment_initialized = false;
+  bool pvt_alignment_ready = false;
+  bool have_previous_pvt_loop_pose = false;
+  PvtAlignmentSample previous_pvt_loop_pose;
+  Eigen::Vector3d pvt_alignment_origin_ecef = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d pvt_R_ecef_enu = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d pvt_R_enu_local = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d pvt_R_enu_local_prior = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d pvt_t_enu_local = Eigen::Vector3d::Zero();
+  Eigen::Vector3d pvt_t_enu_local_prior = Eigen::Vector3d::Zero();
+  Eigen::Vector3d pvt_Tex_imu_r = Eigen::Vector3d::Zero();
+  Eigen::Vector3d pvt_Tex_imu_r_prior = Eigen::Vector3d::Zero();
+  bool pvt_enu_odom_ready = false;
+  Eigen::Matrix3d pvt_enu_odom_R_enu_local =
+      Eigen::Matrix3d::Identity();
+  Eigen::Vector3d pvt_enu_odom_t_enu_local =
+      Eigen::Vector3d::Zero();
   vector<LoopPvtConstraint> accepted_pvt_loop_constraints;
   bool have_last_pvt_loop_position = false;
   Eigen::Vector3d last_pvt_loop_position = Eigen::Vector3d::Zero();
@@ -981,15 +1016,35 @@ public:
         p_gnss->min_hor_vel = gnss_min_hor_vel;
         n.param<bool>("GNSS/tight_coupling_enable", gnss_tight_coupling_enable, true);
         n.param<bool>("GNSS/tdcp_doppler_ieskf_enable", gnss_tdcp_doppler_ieskf_enable, false);
-        n.param<bool>("GNSS/write_back_state", gnss_write_back_state, false);
         n.param<bool>("GNSS/pvt_loop_enable", gnss_pvt_loop_enable, true);
         n.param<double>("GNSS/pvt_loop_min_distance", gnss_pvt_loop_min_distance, 5.0);
         n.param<double>("GNSS/pvt_loop_time_tolerance", gnss_pvt_loop_time_tolerance, 0.2);
         n.param<int>("GNSS/pvt_loop_trigger_count", gnss_pvt_loop_trigger_count, 3);
+        n.param<bool>("GNSS/pvt_robust_kernel_enable", gnss_pvt_robust_kernel_enable, true);
+        n.param<double>("GNSS/pvt_huber_threshold", gnss_pvt_huber_threshold, 2.5);
+        n.param<int>("GNSS/pvt_alignment_min_samples", gnss_pvt_alignment_min_samples, 20);
+        n.param<int>("GNSS/pvt_alignment_max_samples", gnss_pvt_alignment_max_samples, 500);
+        n.param<double>("GNSS/pvt_alignment_min_baseline", gnss_pvt_alignment_min_baseline, 10.0);
+        n.param<double>("GNSS/pvt_alignment_max_rms", gnss_pvt_alignment_max_rms, 3.0);
+        n.param<double>("GNSS/pvt_alignment_rotation_prior_std", gnss_pvt_alignment_rotation_prior_std, 0.35);
+        n.param<double>("GNSS/pvt_alignment_translation_prior_std", gnss_pvt_alignment_translation_prior_std, 100.0);
+        n.param<double>("GNSS/pvt_alignment_lever_prior_std", gnss_pvt_alignment_lever_prior_std, 1.0);
         n.param<double>("GNSS/pvt_recovery_time", gnss_pvt_recovery_time, 10.0);
         n.param<double>("GNSS/pvt_covariance_scale", gnss_pvt_covariance_scale, 100.0);
         n.param<int>("GNSS/pvt_min_num_sv", gnss_pvt_min_num_sv, 6);
         gnss_pvt_loop_trigger_count = max(1, gnss_pvt_loop_trigger_count);
+        gnss_pvt_huber_threshold = max(1e-3, gnss_pvt_huber_threshold);
+        gnss_pvt_alignment_min_samples = max(3, gnss_pvt_alignment_min_samples);
+        gnss_pvt_alignment_max_samples =
+            max(gnss_pvt_alignment_min_samples, gnss_pvt_alignment_max_samples);
+        gnss_pvt_alignment_min_baseline = max(0.0, gnss_pvt_alignment_min_baseline);
+        gnss_pvt_alignment_max_rms = max(0.1, gnss_pvt_alignment_max_rms);
+        gnss_pvt_alignment_rotation_prior_std =
+            max(1e-3, gnss_pvt_alignment_rotation_prior_std);
+        gnss_pvt_alignment_translation_prior_std =
+            max(1e-3, gnss_pvt_alignment_translation_prior_std);
+        gnss_pvt_alignment_lever_prior_std =
+            max(1e-3, gnss_pvt_alignment_lever_prior_std);
         gnss_pvt_recovery_time = max(0.0, gnss_pvt_recovery_time);
         gnss_pvt_covariance_scale = max(1.0, gnss_pvt_covariance_scale);
         gnss_pvt_min_num_sv = max(4, gnss_pvt_min_num_sv);
@@ -998,22 +1053,6 @@ public:
         n.param<double>("GNSS/lio_sqrt_info_max", gnss_lio_sqrt_info_max, 30.0);
         n.param<double>("GNSS/lio_sqrt_info_scale", gnss_lio_sqrt_info_scale, 1.0);
 
-        n.param<double>("GNSS/prior_noise",p_gnss->p_assign->prior_noise, 0.010);
-        n.param<double>("GNSS/marg_noise",p_gnss->p_assign->marg_noise, 0.010);
-        n.param<double>("GNSS/b_acc_noise",p_gnss->pre_integration->acc_w, 0.10);
-        n.param<double>("GNSS/b_omg_noise",p_gnss->pre_integration->gyr_w, 0.10);
-        n.param<double>("GNSS/acc_noise",p_gnss->pre_integration->acc_n, 0.10);
-        n.param<double>("GNSS/omg_noise",p_gnss->pre_integration->gyr_n, 0.10);
-        n.param<double>("GNSS/ddt_noise",p_gnss->p_assign->ddt_noise, 0.10);
-        n.param<double>("GNSS/dt_noise",p_gnss->p_assign->dt_noise, 0.10);
-        n.param<double>("GNSS/psr_dopp_noise",p_gnss->p_assign->psr_dopp_noise,0.1);
-        p_gnss->p_assign->psr_noise = p_gnss->p_assign->psr_dopp_noise;
-        p_gnss->p_assign->dopp_noise = p_gnss->p_assign->psr_dopp_noise;
-        n.param<double>("GNSS/psr_noise",p_gnss->p_assign->psr_noise,p_gnss->p_assign->psr_dopp_noise);
-        n.param<double>("GNSS/dopp_noise",p_gnss->p_assign->dopp_noise,p_gnss->p_assign->psr_dopp_noise);
-        n.param<double>("GNSS/odo_noise",p_gnss->p_assign->odo_noise,0.1);
-        n.param<double>("GNSS/grav_noise",p_gnss->p_assign->grav_noise,0.1);
-        n.param<double>("GNSS/cp_noise",p_gnss->p_assign->cp_noise,0.1);
         n.param<double>("GNSS/psr_std_thres", gnss_psr_std_thres, 2.0);
         n.param<double>("GNSS/dopp_std_thres", gnss_dopp_std_thres, 2.0);
         p_gnss->p_assign->gnss_psr_std_threshold = gnss_psr_std_thres;
@@ -1021,18 +1060,9 @@ public:
         n.param<double>("GNSS/gnss_cp_std_thres",p_gnss->p_assign->gnss_cp_std_threshold, 2.0);
         p_gnss->p_assign->gnss_cp_std_threshold /= 0.004;
         n.param<double>("GNSS/gnss_cp_time_thres",p_gnss->gnss_cp_time_threshold, 2.0);
-        n.param<int>("GNSS/gtsam_variable_thres",p_gnss->delete_thred, 200);
-        n.param<int>("GNSS/gtsam_marg_variable_thres",p_gnss->p_assign->marg_thred, 1);
-        n.param<bool>("GNSS/outlier_rej",p_gnss->p_assign->outlier_rej, true);
-        n.param<double>("GNSS/outlier_thres",p_gnss->p_assign->outlier_thres, 0.1);
-        n.param<double>("GNSS/outlier_thres_init",p_gnss->p_assign->outlier_thres_init, 0.1);
         n.param<double>("GNSS/gnss_sample_period",p_gnss->gnss_sample_period, 1.0);
-        n.param<bool>("GNSS/nolidar",nolidar, false); // not ready yet. only for information. when this value is true, fallback to a system fusing only IMU and GNSS
-        p_gnss->nolidar = nolidar;
-        n.param<bool>("GNSS/pvt_is_gt",p_gnss->p_assign->pvt_is_gt, false);
         n.param<int>("GNSS/window_size",p_gnss->wind_size, 2);
         p_gnss->wind_size = std::max(1, std::min(p_gnss->wind_size, WINDOW_SIZE));
-        p_gnss->p_assign->initNoises();
 
         sub_gnss_ephem = n.subscribe(gnss_ephem_topic, 100, gnss_ephem_handler);
         sub_gnss_glo_ephem = n.subscribe(gnss_glo_ephem_topic, 100, gnss_glo_ephem_handler);
@@ -1084,65 +1114,6 @@ public:
     pub_pl_func(path, pub);
   }
 
-  void print_spp_residuals(const Eigen::Matrix<double, 7, 1> &spp_xyzt,
-                           const vector<gnss_comm::ObsPtr> &obs,
-                           const vector<gnss_comm::EphemBasePtr> &ephems) const
-  {
-    if(spp_xyzt.head<3>().norm() < 1.0 || obs.size() < 4 || obs.size() != ephems.size() ||
-       !p_gnss || p_gnss->p_assign->latest_gnss_iono_params.size() != 8)
-      return;
-
-    vector<gnss_comm::ObsPtr> valid_obs;
-    vector<gnss_comm::EphemBasePtr> valid_ephems;
-    gnss_comm::filter_L1(obs, ephems, valid_obs, valid_ephems);
-    if(valid_obs.size() < 4)
-      return;
-
-    vector<gnss_comm::SatStatePtr> all_sat_states = gnss_comm::sat_states(valid_obs, valid_ephems);
-    Eigen::VectorXd residuals;
-    Eigen::MatrixXd jacobian;
-    vector<Eigen::Vector2d> atmos_delay;
-    vector<Eigen::Vector2d> all_sv_azel;
-    gnss_comm::psr_res(spp_xyzt,
-                       valid_obs,
-                       all_sat_states,
-                       p_gnss->p_assign->latest_gnss_iono_params,
-                       residuals,
-                       jacobian,
-                       atmos_delay,
-                       all_sv_azel);
-
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(3);
-    oss << "GNSS SPP pseudorange residuals, obs=" << valid_obs.size()
-        << " pos_ecef=[" << spp_xyzt(0) << ", " << spp_xyzt(1) << ", " << spp_xyzt(2)
-        << "] clk=[" << spp_xyzt(3) << ", " << spp_xyzt(4) << ", "
-        << spp_xyzt(5) << ", " << spp_xyzt(6) << "]";
-
-    for(size_t i = 0; i < valid_obs.size(); ++i)
-    {
-      int l1_idx = -1;
-      gnss_comm::L1_freq(valid_obs[i], &l1_idx);
-      const double psr_std =
-          (l1_idx >= 0 && l1_idx < static_cast<int>(valid_obs[i]->psr_std.size())) ?
-          valid_obs[i]->psr_std[l1_idx] : -1.0;
-      const double elevation_deg =
-          (i < all_sv_azel.size()) ? all_sv_azel[i].y() * 180.0 / M_PI : 0.0;
-      const double ion_delay = (i < atmos_delay.size()) ? atmos_delay[i].x() : 0.0;
-      const double trop_delay = (i < atmos_delay.size()) ? atmos_delay[i].y() : 0.0;
-      const double res = (i < static_cast<size_t>(residuals.size())) ? residuals(i) : 0.0;
-
-      oss << "\n  " << gnss_comm::sat2str(valid_obs[i]->sat)
-          << " res=" << res << " m"
-          << " el=" << elevation_deg << " deg"
-          << " ion=" << ion_delay << " m"
-          << " trop=" << trop_delay << " m"
-          << " psr_std=" << psr_std << " m";
-    }
-
-    ROS_INFO_STREAM(oss.str());
-  }
-
   bool lookup_gnss_ephem(const gnss_comm::ObsPtr &obs, gnss_comm::EphemBasePtr &ephem) const
   {
     if(!p_gnss || !p_gnss->p_assign || !obs)
@@ -1175,75 +1146,49 @@ public:
     return static_cast<bool>(ephem);
   }
 
-  void update_gnss_clock_cache_from_graph()
+  void publish_lio_enu_odometry(const IMUST &state)
   {
-    if(!p_gnss || !p_gnss->gnss_ready || p_gnss->frame_num <= 0)
-      return;
-
-    const int latest_frame = p_gnss->frame_num - 1;
-    const gtsam::Values &estimate = p_gnss->p_assign->isamCurrentEstimate;
-    if(!estimate.exists(B(latest_frame)) || !estimate.exists(C(latest_frame)))
-      return;
-
-    const gtsam::Vector4 rcv_dt = estimate.at<gtsam::Vector4>(B(latest_frame));
-    const gtsam::Vector1 rcv_ddt = estimate.at<gtsam::Vector1>(C(latest_frame));
-    gnss_rcv_dt.resize(4);
-    for(int i = 0; i < 4; ++i)
+    Eigen::Matrix3d R_enu_local;
+    Eigen::Vector3d t_enu_local;
     {
-      gnss_rcv_dt[i] = rcv_dt[i];
-      p_gnss->para_rcv_dt[i] = rcv_dt[i];
+      lock_guard<mutex> lock(mtx_pvt_loop);
+      if(!pvt_enu_odom_ready)
+        return;
+      R_enu_local = pvt_enu_odom_R_enu_local;
+      t_enu_local = pvt_enu_odom_t_enu_local;
     }
-    gnss_rcv_ddt = rcv_ddt[0];
-    p_gnss->para_rcv_ddt[0] = gnss_rcv_ddt;
-  }
 
-  void publish_gnss_spp_local_path(const vector<gnss_comm::ObsPtr> &raw_obs,
-                                    const IMUST &lidar_state)
-  {
-    if(!GNSS_enable || !gnss_ready || !p_gnss ||
-       raw_obs.size() < 4 ||
-       p_gnss->p_assign->latest_gnss_iono_params.size() != 8)
-      return;
+    const Eigen::Vector3d position_enu =
+        R_enu_local * state.p + t_enu_local;
+    const Eigen::Matrix3d rotation_enu_body =
+        R_enu_local * state.R;
+    Eigen::Quaterniond quaternion_enu_body(rotation_enu_body);
+    quaternion_enu_body.normalize();
 
-    vector<gnss_comm::ObsPtr> obs_with_ephem;
-    vector<gnss_comm::EphemBasePtr> ephems;
-    obs_with_ephem.reserve(raw_obs.size());
-    ephems.reserve(raw_obs.size());
-    for(const auto &obs : raw_obs)
-    {
-      gnss_comm::EphemBasePtr ephem;
-      if(lookup_gnss_ephem(obs, ephem))
-      {
-        obs_with_ephem.push_back(obs);
-        ephems.push_back(ephem);
-      }
-    }
-    if(obs_with_ephem.size() < 4)
-      return;
+    nav_msgs::Odometry odometry;
+    odometry.header.stamp.fromSec(state.t);
+    odometry.header.frame_id = "enu";
+    odometry.child_frame_id = "lio_body";
+    odometry.pose.pose.position.x = position_enu.x();
+    odometry.pose.pose.position.y = position_enu.y();
+    odometry.pose.pose.position.z = position_enu.z();
+    odometry.pose.pose.orientation.w = quaternion_enu_body.w();
+    odometry.pose.pose.orientation.x = quaternion_enu_body.x();
+    odometry.pose.pose.orientation.y = quaternion_enu_body.y();
+    odometry.pose.pose.orientation.z = quaternion_enu_body.z();
 
-    Eigen::Matrix<double, 7, 1> spp_xyzt =
-        gnss_comm::psr_pos(obs_with_ephem, ephems, p_gnss->p_assign->latest_gnss_iono_params);
-    Eigen::Vector3d spp_ecef = spp_xyzt.head<3>();
-
-    // print_spp_residuals(spp_xyzt, obs_with_ephem, ephems);
-    Eigen::Vector3d spp_local;
-    if(!ecef_to_gnss_local(spp_ecef, spp_local))
-      return;
-
-    const double stamp = obs_with_ephem.empty() ? lidar_state.t :
-        gnss_comm::time2sec(obs_with_ephem.front()->time) - gnss_local_time_diff;
-    Eigen::Vector3d diff = spp_local - lidar_state.p;
-    append_gnss_local_path(spp_local,
-                           stamp,
-                           diff.norm(),
-                           gnss_spp_local_path,
-                           pub_gnss_spp_local);
-
-    // ROS_INFO_THROTTLE(1.0,
-    //   "GNSS SPP local %.3f %.3f %.3f | Lidar %.3f %.3f %.3f | diff %.3f %.3f %.3f norm %.3f obs=%lu",
-    //   spp_local.x(), spp_local.y(), spp_local.z(),
-    //   lidar_state.p.x(), lidar_state.p.y(), lidar_state.p.z(),
-    //   diff.x(), diff.y(), diff.z(), diff.norm(), obs_with_ephem.size());
+    // nav_msgs/Odometry defines twist in child_frame_id.
+    const Eigen::Vector3d velocity_body =
+        state.R.transpose() * state.v;
+    const Eigen::Vector3d angular_velocity_body =
+        state.omg - state.bg;
+    odometry.twist.twist.linear.x = velocity_body.x();
+    odometry.twist.twist.linear.y = velocity_body.y();
+    odometry.twist.twist.linear.z = velocity_body.z();
+    odometry.twist.twist.angular.x = angular_velocity_body.x();
+    odometry.twist.twist.angular.y = angular_velocity_body.y();
+    odometry.twist.twist.angular.z = angular_velocity_body.z();
+    pub_lio_odom_enu.publish(odometry);
   }
 
   void navsat_fix_handler(const gnss_comm::GnssPVTSolnMsgConstPtr &msg)
@@ -1321,6 +1266,29 @@ public:
       p_gnss->inputpvt(
           pvt_gnss_time, msg->latitude, msg->longitude, msg->altitude,
           msg->h_acc, msg->v_acc, msg->carr_soln, msg->diff_soln);
+
+      RawLoopPvtMeasurement measurement;
+      measurement.timestamp = pvt_gnss_time - gnss_local_time_diff;
+      measurement.ecef = gnss_comm::geo2ecef(
+          Eigen::Vector3d(msg->latitude, msg->longitude, msg->altitude));
+      const double covariance_scale = gnss_pvt_covariance_scale;
+      const double horizontal_sigma =
+          max(gnss_pvt_min_position_std, static_cast<double>(msg->h_acc));
+      const double vertical_sigma =
+          max(gnss_pvt_min_position_std, static_cast<double>(msg->v_acc));
+      measurement.variances <<
+          covariance_scale * horizontal_sigma * horizontal_sigma,
+          covariance_scale * horizontal_sigma * horizontal_sigma,
+          covariance_scale * vertical_sigma * vertical_sigma;
+      if(measurement.ecef.allFinite() &&
+         measurement.variances.allFinite())
+      {
+        lock_guard<mutex> lock(mtx_pvt_loop);
+        raw_pvt_loop_measurements.push_back(measurement);
+        while(raw_pvt_loop_measurements.size() >
+              static_cast<size_t>(2 * gnss_pvt_alignment_max_samples))
+          raw_pvt_loop_measurements.pop_front();
+      }
     }
 
     if(!gnss_ready || !position_fix_valid)
@@ -1335,72 +1303,6 @@ public:
     pt.intensity = 0.0;
     pt.curvature = pvt_gnss_time - gnss_local_time_diff;
     gnss_pvt_ecef_path.push_back(pt);
-  }
-
-  void queue_pvt_match_after_gnss_update(const IMUST &state)
-  {
-    if(!gnss_pvt_loop_enable || !p_gnss)
-      return;
-    PendingPvtMatch pending;
-    pending.timestamp = state.t;
-    pending.body_rotation = state.R;
-    pending_pvt_matches.push_back(pending);
-    while(pending_pvt_matches.size() > 20)
-      pending_pvt_matches.pop_front();
-  }
-
-  void resolve_pending_pvt_matches(double current_time)
-  {
-    if(!gnss_pvt_loop_enable || !p_gnss)
-      return;
-
-    while(!pending_pvt_matches.empty())
-    {
-      const PendingPvtMatch pending = pending_pvt_matches.front();
-      GNSSProcess::PvtResult pvt;
-      if(!p_gnss->matchClosestPvt(
-             pending.timestamp, gnss_pvt_loop_time_tolerance, pvt))
-      {
-        if(current_time - pending.timestamp >
-           gnss_pvt_loop_time_tolerance + 1.0)
-          pending_pvt_matches.pop_front();
-        break;
-      }
-
-      const Eigen::Vector3d antenna_local =
-          p_gnss->R_ecef_enu.transpose() *
-          (pvt.ecef - p_gnss->anc_ecef);
-      const Eigen::Vector3d body_local =
-          antenna_local - pending.body_rotation * p_gnss->Tex_imu_r;
-      pending_pvt_matches.pop_front();
-      if(!body_local.allFinite())
-        continue;
-
-      lock_guard<mutex> lock(mtx_pvt_loop);
-      if(have_last_pvt_loop_position &&
-         (body_local - last_pvt_loop_position).norm() <
-             gnss_pvt_loop_min_distance)
-        continue;
-
-      LoopPvtConstraint constraint;
-      constraint.timestamp = pvt.timestamp;
-      constraint.position = body_local;
-      constraint.variances =
-          gnss_pvt_covariance_scale * pvt.variance_enu;
-      pending_pvt_loop_constraints.push_back(constraint);
-      last_pvt_loop_position = body_local;
-      have_last_pvt_loop_position = true;
-      ROS_INFO(
-          "PVT loop constraint cached: t=%.6f p=[%.3f %.3f %.3f] "
-          "std=[%.3f %.3f %.3f] spacing=%.1f m",
-          constraint.timestamp,
-          constraint.position.x(), constraint.position.y(),
-          constraint.position.z(),
-          std::sqrt(constraint.variances.x()),
-          std::sqrt(constraint.variances.y()),
-          std::sqrt(constraint.variances.z()),
-          gnss_pvt_loop_min_distance);
-    }
   }
 
   bool pvt_quality_check(const gnss_comm::PVTSolutionPtr &pvt) const
@@ -2409,12 +2311,27 @@ public:
       lock_guard<mutex> lock(mPvtBuf);
       gnss_pvt_buf.clear();
     }
-    pending_pvt_matches.clear();
     {
       lock_guard<mutex> lock(mtx_pvt_loop);
-      pending_pvt_loop_constraints.clear();
+      raw_pvt_loop_measurements.clear();
+      pvt_alignment_samples.clear();
+      accepted_pvt_loop_constraints.clear();
       have_last_pvt_loop_position = false;
       last_pvt_loop_position.setZero();
+      pvt_alignment_initialized = false;
+      pvt_alignment_ready = false;
+      have_previous_pvt_loop_pose = false;
+      pvt_alignment_origin_ecef.setZero();
+      pvt_R_ecef_enu.setIdentity();
+      pvt_R_enu_local.setIdentity();
+      pvt_R_enu_local_prior.setIdentity();
+      pvt_t_enu_local.setZero();
+      pvt_t_enu_local_prior.setZero();
+      pvt_Tex_imu_r.setZero();
+      pvt_Tex_imu_r_prior.setZero();
+      pvt_enu_odom_ready = false;
+      pvt_enu_odom_R_enu_local.setIdentity();
+      pvt_enu_odom_t_enu_local.setZero();
     }
     {
       lock_guard<mutex> lock(mGnssMeasBuf);
@@ -2794,14 +2711,9 @@ public:
         }
         if(gnss_tdcp_doppler_ieskf_enable && gnss_ready &&
            !matched_gnss_raw.empty())
-          publish_gnss_spp_local_path(matched_gnss_raw, x_curr);
-        if(gnss_tdcp_doppler_ieskf_enable && gnss_ready &&
-           !matched_gnss_raw.empty())
-          queue_pvt_match_after_gnss_update(x_curr);
-        resolve_pending_pvt_matches(x_curr.t);
-        // if(spatial_alignment_with_pvt(x_curr)){
-          
-        // }
+        // PVT/LIO matching and loop-frame calibration are intentionally
+        // deferred to thd_loop_closure. Absolute factors must not enter the
+        // graph before R_enu_local, t_enu_local and the lever arm converge.
 
         if(state_update_ok)
         {
@@ -2818,6 +2730,7 @@ public:
         pwld.clear();
         pvec_update(pptr, x_curr, pwld);
         ResultOutput::instance().pub_localtraj(pwld, jour, x_curr, sessionNames.size()-1, pcl_path);
+        publish_lio_enu_odometry(x_curr);
 
         t1 = ros::Time::now().toSec();
 
@@ -2969,57 +2882,413 @@ public:
     malloc_trim(0);
   }
 
-  bool add_pending_pvt_factor(
-      double pose_timestamp, int session_id, int pose_id,
-      gtsam::Key graph_key, gtsam::NonlinearFactorGraph &graph)
+  void initialize_pvt_alignment_coordinates(
+      const RawLoopPvtMeasurement &measurement)
   {
-    lock_guard<mutex> lock(mtx_pvt_loop);
-    while(!pending_pvt_loop_constraints.empty() &&
-          pending_pvt_loop_constraints.front().timestamp <
-              pose_timestamp - gnss_pvt_loop_time_tolerance)
-      pending_pvt_loop_constraints.pop_front();
-    if(pending_pvt_loop_constraints.empty())
+    const bool anchor_valid =
+        gnss_anchor_ecef.allFinite() &&
+        gnss_anchor_ecef.norm() > 1e6;
+    pvt_alignment_origin_ecef =
+        anchor_valid ? gnss_anchor_ecef : measurement.ecef;
+    pvt_R_ecef_enu =
+        gnss_comm::ecef2rotation(pvt_alignment_origin_ecef);
+    pvt_R_enu_local =
+        pvt_R_ecef_enu.transpose() * gnss_R_ecef_enu;
+    pvt_R_enu_local_prior = pvt_R_enu_local;
+    pvt_t_enu_local.setZero();
+    if(anchor_valid)
+      pvt_t_enu_local =
+          pvt_R_ecef_enu.transpose() *
+          (gnss_anchor_ecef - pvt_alignment_origin_ecef);
+    pvt_t_enu_local_prior = pvt_t_enu_local;
+    pvt_Tex_imu_r.setZero();
+    if(p_gnss)
+      pvt_Tex_imu_r = p_gnss->Tex_imu_r;
+    pvt_Tex_imu_r_prior = pvt_Tex_imu_r;
+    pvt_alignment_initialized = true;
+  }
+
+  bool append_pvt_alignment_sample(
+      const RawLoopPvtMeasurement &measurement,
+      const PvtAlignmentSample &pose)
+  {
+    if(!pvt_alignment_initialized)
+      initialize_pvt_alignment_coordinates(measurement);
+
+    PvtAlignmentSample sample = pose;
+    sample.timestamp = measurement.timestamp;
+    sample.time_error =
+        std::fabs(measurement.timestamp - pose.timestamp);
+    sample.pvt_enu =
+        pvt_R_ecef_enu.transpose() *
+        (measurement.ecef - pvt_alignment_origin_ecef);
+    sample.variances = measurement.variances;
+    if(!sample.pvt_enu.allFinite())
       return false;
 
-    auto best = pending_pvt_loop_constraints.end();
-    double best_error = gnss_pvt_loop_time_tolerance;
-    for(auto iter = pending_pvt_loop_constraints.begin();
-        iter != pending_pvt_loop_constraints.end(); ++iter)
+    pvt_alignment_samples.push_back(sample);
+    while(pvt_alignment_samples.size() >
+          static_cast<size_t>(gnss_pvt_alignment_max_samples))
+      pvt_alignment_samples.pop_front();
+    return true;
+  }
+
+  bool optimize_pvt_alignment()
+  {
+    if(pvt_alignment_ready ||
+       pvt_alignment_samples.size() <
+           static_cast<size_t>(gnss_pvt_alignment_min_samples))
+      return false;
+
+    double baseline = 0.0;
+    const Eigen::Vector3d &first_position =
+        pvt_alignment_samples.front().lidar_position;
+    for(const PvtAlignmentSample &sample : pvt_alignment_samples)
+      baseline = max(
+          baseline, (sample.lidar_position - first_position).norm());
+    if(baseline < gnss_pvt_alignment_min_baseline)
     {
-      const double time_error =
-          std::fabs(iter->timestamp - pose_timestamp);
-      if(time_error <= best_error)
+      ROS_INFO_THROTTLE(
+          2.0, "PVT loop alignment collecting without time/distance "
+          "thresholds: samples=%lu baseline=%.2f/%.2f m",
+          static_cast<unsigned long>(pvt_alignment_samples.size()),
+          baseline, gnss_pvt_alignment_min_baseline);
+      return false;
+    }
+
+    Eigen::Matrix3d rotation = pvt_R_enu_local;
+    Eigen::Vector3d translation = pvt_t_enu_local;
+    Eigen::Vector3d lever = pvt_Tex_imu_r;
+    Eigen::Matrix<double, 9, 1> delta =
+        Eigen::Matrix<double, 9, 1>::Zero();
+    double weighted_rms = std::numeric_limits<double>::infinity();
+
+    for(int iteration = 0; iteration < 15; ++iteration)
+    {
+      Eigen::Matrix<double, 9, 9> hessian =
+          Eigen::Matrix<double, 9, 9>::Zero();
+      Eigen::Matrix<double, 9, 1> gradient =
+          Eigen::Matrix<double, 9, 1>::Zero();
+      double weighted_error = 0.0;
+      int residual_dimension = 0;
+
+      for(const PvtAlignmentSample &sample : pvt_alignment_samples)
       {
-        best = iter;
-        best_error = time_error;
+        const Eigen::Vector3d antenna_local =
+            sample.lidar_position + sample.lidar_rotation * lever;
+        const Eigen::Vector3d rotated_antenna =
+            rotation * antenna_local;
+        const Eigen::Vector3d residual =
+            rotated_antenna + translation - sample.pvt_enu;
+        Eigen::Matrix<double, 3, 9> jacobian;
+        jacobian.block<3, 3>(0, 0) = -hat(rotated_antenna);
+        jacobian.block<3, 3>(0, 3).setIdentity();
+        jacobian.block<3, 3>(0, 6) =
+            rotation * sample.lidar_rotation;
+
+        const Eigen::Matrix3d information =
+            sample.variances.cwiseMax(
+                Eigen::Vector3d::Constant(0.0025))
+                .cwiseInverse().asDiagonal();
+        const double squared_mahalanobis =
+            residual.dot(information * residual);
+        const double mahalanobis =
+            sqrt(max(0.0, squared_mahalanobis));
+        const double robust_weight =
+            mahalanobis <= 3.0 ? 1.0 : 3.0 / mahalanobis;
+        hessian += robust_weight *
+            jacobian.transpose() * information * jacobian;
+        gradient += robust_weight *
+            jacobian.transpose() * information * residual;
+        weighted_error += robust_weight * squared_mahalanobis;
+        residual_dimension += 3;
       }
-      if(iter->timestamp >
-         pose_timestamp + gnss_pvt_loop_time_tolerance)
+
+      const double rotation_prior_information =
+          1.0 / (gnss_pvt_alignment_rotation_prior_std *
+                 gnss_pvt_alignment_rotation_prior_std);
+      const double translation_prior_information =
+          1.0 / (gnss_pvt_alignment_translation_prior_std *
+                 gnss_pvt_alignment_translation_prior_std);
+      const double lever_prior_information =
+          1.0 / (gnss_pvt_alignment_lever_prior_std *
+                 gnss_pvt_alignment_lever_prior_std);
+      hessian.block<3, 3>(0, 0).diagonal().array() +=
+          rotation_prior_information;
+      gradient.segment<3>(0) += rotation_prior_information *
+          Log(rotation * pvt_R_enu_local_prior.transpose());
+      hessian.block<3, 3>(3, 3).diagonal().array() +=
+          translation_prior_information;
+      gradient.segment<3>(3) += translation_prior_information *
+          (translation - pvt_t_enu_local_prior);
+      hessian.block<3, 3>(6, 6).diagonal().array() +=
+          lever_prior_information;
+      gradient.segment<3>(6) += lever_prior_information *
+          (lever - pvt_Tex_imu_r_prior);
+
+      Eigen::LDLT<Eigen::Matrix<double, 9, 9>> solver(hessian);
+      if(solver.info() != Eigen::Success)
+      {
+        ROS_WARN("PVT loop alignment normal equation is singular.");
+        return false;
+      }
+      delta = solver.solve(-gradient);
+      if(!delta.allFinite())
+        return false;
+
+      rotation = Exp(delta.segment<3>(0)) * rotation;
+      translation += delta.segment<3>(3);
+      lever += delta.segment<3>(6);
+      weighted_rms =
+          sqrt(weighted_error / max(1, residual_dimension));
+      if(delta.segment<3>(0).norm() < 1e-7 &&
+         delta.segment<3>(3).norm() < 1e-5 &&
+         delta.segment<3>(6).norm() < 1e-5)
         break;
     }
-    if(best == pending_pvt_loop_constraints.end())
+
+    pvt_R_enu_local = rotation;
+    pvt_t_enu_local = translation;
+    pvt_Tex_imu_r = lever;
+    const bool converged =
+        weighted_rms <= gnss_pvt_alignment_max_rms &&
+        delta.segment<3>(0).norm() < 5e-4 &&
+        delta.segment<3>(3).norm() < 0.02 &&
+        delta.segment<3>(6).norm() < 0.01;
+    ROS_INFO(
+        "PVT loop alignment ILS: samples=%lu baseline=%.2f "
+        "weighted_rms=%.3f converged=%d R_log_deg=[%.3f %.3f %.3f] "
+        "t_enu_local=[%.3f %.3f %.3f] Tex_imu_r=[%.3f %.3f %.3f]",
+        static_cast<unsigned long>(pvt_alignment_samples.size()),
+        baseline, weighted_rms, converged,
+        Log(rotation).x() * 57.2957795,
+        Log(rotation).y() * 57.2957795,
+        Log(rotation).z() * 57.2957795,
+        translation.x(), translation.y(), translation.z(),
+        lever.x(), lever.y(), lever.z());
+    if(!converged)
       return false;
 
-    LoopPvtConstraint constraint = *best;
-    pending_pvt_loop_constraints.erase(
-        pending_pvt_loop_constraints.begin(), std::next(best));
-    constraint.session_id = session_id;
-    constraint.pose_id = pose_id;
-    constraint.variances =
-        constraint.variances.cwiseMax(Eigen::Vector3d::Constant(0.0025));
-    const auto noise =
-        gtsam::noiseModel::Diagonal::Variances(
-            gtsam::Vector3(constraint.variances));
-    graph.add(gtsam::GPSFactor(
-        graph_key, gtsam::Point3(constraint.position), noise));
-    accepted_pvt_loop_constraints.push_back(constraint);
-    ROS_INFO(
-        "PVT absolute factor added: session=%d pose=%d dt=%.3f "
-        "p=[%.3f %.3f %.3f]",
-        session_id, pose_id, best_error,
-        constraint.position.x(), constraint.position.y(),
-        constraint.position.z());
+    pvt_alignment_ready = true;
+    {
+      lock_guard<mutex> lock(mtx_pvt_loop);
+      pvt_enu_odom_R_enu_local = pvt_R_enu_local;
+      pvt_enu_odom_t_enu_local = pvt_t_enu_local;
+      pvt_enu_odom_ready = true;
+    }
     return true;
+  }
+
+  bool add_aligned_pvt_factor(
+      const PvtAlignmentSample &sample,
+      const vector<int> &ids, const vector<int> &stepsizes,
+      gtsam::NonlinearFactorGraph &graph)
+  {
+    if(!pvt_alignment_ready ||
+       sample.time_error > gnss_pvt_loop_time_tolerance)
+      return false;
+
+    const Eigen::Vector3d antenna_local =
+        pvt_R_enu_local.transpose() *
+        (sample.pvt_enu - pvt_t_enu_local);
+    const Eigen::Vector3d body_local =
+        antenna_local - sample.lidar_rotation * pvt_Tex_imu_r;
+    if(!body_local.allFinite() ||
+       (have_last_pvt_loop_position &&
+        (body_local - last_pvt_loop_position).norm() <
+            gnss_pvt_loop_min_distance))
+      return false;
+
+    auto session =
+        std::find(ids.begin(), ids.end(), sample.session_id);
+    if(session == ids.end())
+      return false;
+    const int session_index =
+        static_cast<int>(std::distance(ids.begin(), session));
+    if(session_index + 1 >= static_cast<int>(stepsizes.size()) ||
+       sample.pose_id < 0 ||
+       sample.pose_id >=
+           stepsizes[session_index + 1] - stepsizes[session_index])
+      return false;
+
+    LoopPvtConstraint constraint;
+    constraint.timestamp = sample.timestamp;
+    constraint.position = body_local;
+    constraint.session_id = sample.session_id;
+    constraint.pose_id = sample.pose_id;
+    const Eigen::Matrix3d covariance_local =
+        pvt_R_enu_local.transpose() *
+        sample.variances.asDiagonal() * pvt_R_enu_local;
+    constraint.variances =
+        covariance_local.diagonal().cwiseMax(
+            Eigen::Vector3d::Constant(0.0025));
+    const gtsam::SharedNoiseModel noise =
+        create_pvt_factor_noise(constraint.variances);
+    const gtsam::Key key =
+        stepsizes[session_index] + sample.pose_id;
+    graph.add(gtsam::GPSFactor(
+        key, gtsam::Point3(constraint.position), noise));
+    accepted_pvt_loop_constraints.push_back(constraint);
+    last_pvt_loop_position = body_local;
+    have_last_pvt_loop_position = true;
+    const Eigen::Vector3d initial_residual =
+        sample.lidar_position - body_local;
+    const double whitened_residual = sqrt(max(
+        0.0, initial_residual.dot(
+            constraint.variances.cwiseInverse()
+                .asDiagonal() * initial_residual)));
+    const double robust_weight =
+        !gnss_pvt_robust_kernel_enable ||
+        whitened_residual <= gnss_pvt_huber_threshold ?
+        1.0 : gnss_pvt_huber_threshold / whitened_residual;
+    ROS_INFO(
+        "Aligned PVT factor added: session=%d pose=%d dt=%.3f "
+        "p=[%.3f %.3f %.3f] whitened_residual=%.3f "
+        "huber_weight=%.3f",
+        constraint.session_id, constraint.pose_id, sample.time_error,
+        body_local.x(), body_local.y(), body_local.z(),
+        whitened_residual, robust_weight);
+    return true;
+  }
+
+  gtsam::SharedNoiseModel create_pvt_factor_noise(
+      const Eigen::Vector3d &variances) const
+  {
+    const Eigen::Vector3d bounded_variances =
+        variances.cwiseMax(Eigen::Vector3d::Constant(0.0025));
+    const gtsam::SharedNoiseModel gaussian =
+        gtsam::noiseModel::Diagonal::Variances(
+            gtsam::Vector3(bounded_variances));
+    if(!gnss_pvt_robust_kernel_enable)
+      return gaussian;
+
+    return gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Huber::Create(
+            gnss_pvt_huber_threshold),
+        gaussian);
+  }
+
+  void publish_aligned_pvt_local_path()
+  {
+    if(!pvt_alignment_ready || pvt_alignment_samples.empty())
+      return;
+
+    gnss_pvt_local_path.clear();
+    gnss_pvt_local_path.reserve(pvt_alignment_samples.size());
+    for(const PvtAlignmentSample &sample : pvt_alignment_samples)
+    {
+      // PVT measures the antenna phase-center position. Keep the lever arm
+      // in the factor conversion only; this topic visualizes the raw PVT
+      // trajectory expressed in the LIO local/world coordinate system.
+      const Eigen::Vector3d antenna_local =
+          pvt_R_enu_local.transpose() *
+          (sample.pvt_enu - pvt_t_enu_local);
+      if(!antenna_local.allFinite())
+        continue;
+
+      PointType point;
+      point.x = antenna_local.x();
+      point.y = antenna_local.y();
+      point.z = antenna_local.z();
+      point.intensity = 0.0;
+      point.curvature = sample.timestamp;
+      gnss_pvt_local_path.push_back(point);
+    }
+    pub_pl_func(gnss_pvt_local_path, pub_gnss_pvt_local);
+  }
+
+  int collect_and_process_pvt_for_loop_pose(
+      const IMUST &pose, int session_id, int pose_id,
+      const vector<int> &ids, const vector<int> &stepsizes,
+      gtsam::NonlinearFactorGraph &graph, bool &alignment_just_finished)
+  {
+    alignment_just_finished = false;
+    PvtAlignmentSample current_pose;
+    current_pose.timestamp = pose.t;
+    current_pose.lidar_position = pose.p;
+    current_pose.lidar_rotation = pose.R;
+    current_pose.session_id = session_id;
+    current_pose.pose_id = pose_id;
+
+    vector<pair<RawLoopPvtMeasurement, PvtAlignmentSample>> matches;
+    {
+      lock_guard<mutex> lock(mtx_pvt_loop);
+      if(!have_previous_pvt_loop_pose)
+      {
+        while(!raw_pvt_loop_measurements.empty() &&
+              raw_pvt_loop_measurements.front().timestamp <= pose.t)
+        {
+          matches.emplace_back(
+              raw_pvt_loop_measurements.front(), current_pose);
+          raw_pvt_loop_measurements.pop_front();
+        }
+      }
+      else
+      {
+        const double midpoint =
+            0.5 * (previous_pvt_loop_pose.timestamp + pose.t);
+        while(!raw_pvt_loop_measurements.empty() &&
+              raw_pvt_loop_measurements.front().timestamp <= midpoint)
+        {
+          matches.emplace_back(
+              raw_pvt_loop_measurements.front(),
+              previous_pvt_loop_pose);
+          raw_pvt_loop_measurements.pop_front();
+        }
+      }
+      previous_pvt_loop_pose = current_pose;
+      have_previous_pvt_loop_pose = true;
+    }
+
+    int added_factors = 0;
+    for(const auto &match : matches)
+    {
+      const bool appended =
+          append_pvt_alignment_sample(match.first, match.second);
+      if(appended && pvt_alignment_ready &&
+         add_aligned_pvt_factor(
+             pvt_alignment_samples.back(), ids, stepsizes, graph))
+        ++added_factors;
+    }
+
+    if(!pvt_alignment_ready && optimize_pvt_alignment())
+    {
+      alignment_just_finished = true;
+      have_last_pvt_loop_position = false;
+      last_pvt_loop_position.setZero();
+      for(const PvtAlignmentSample &sample : pvt_alignment_samples)
+      {
+        if(add_aligned_pvt_factor(sample, ids, stepsizes, graph))
+          ++added_factors;
+      }
+      ROS_INFO(
+          "PVT loop alignment committed; restored dt<=%.3f s and "
+          "spacing>=%.2f m, added %d initialization factors.",
+          gnss_pvt_loop_time_tolerance,
+          gnss_pvt_loop_min_distance, added_factors);
+    }
+    if(pvt_alignment_ready &&
+       (!matches.empty() || alignment_just_finished))
+      publish_aligned_pvt_local_path();
+    return added_factors;
+  }
+
+  size_t clear_cached_pvt_for_btc(
+      int session_id, int current_pose_id)
+  {
+    size_t cleared_count = 0;
+    {
+      lock_guard<mutex> lock(mtx_pvt_loop);
+      cleared_count = raw_pvt_loop_measurements.size();
+      raw_pvt_loop_measurements.clear();
+    }
+    ROS_WARN(
+        "BTC loop candidate detected: cleared %lu cached PVT "
+        "measurements at "
+        "session=%d pose=%d; existing graph PVT factors are retained.",
+        static_cast<unsigned long>(cleared_count),
+        session_id, current_pose_id);
+    return cleared_count;
   }
 
   void add_persisted_pvt_factors(const vector<int> &ids, const vector<int> &stepsizes,
@@ -3040,255 +3309,13 @@ public:
 
       const gtsam::Key key =
           stepsizes[session_index] + constraint.pose_id;
-      const auto noise =
-          gtsam::noiseModel::Diagonal::Variances(
-              gtsam::Vector3(constraint.variances));
+      const gtsam::SharedNoiseModel noise =
+          create_pvt_factor_noise(constraint.variances);
       graph.add(gtsam::GPSFactor(
           key, gtsam::Point3(constraint.position), noise));
     }
   }
 
-  /* bool spatial_alignment_with_pvt(const IMUST &lidar_state)
-  {
-    if(!gnss_ready || !p_gnss)
-      return false;
-    if(pvt_alignment_ready)
-      return true;
-
-    gnss_comm::PVTSolutionPtr matched_pvt;
-    {
-      lock_guard<mutex> lock(mPvtBuf);
-      while(!gnss_pvt_buf.empty())
-      {
-        const double pvt_time =
-            gnss_comm::time2sec(gnss_pvt_buf.front()->time) -
-            gnss_local_time_diff;
-        if(pvt_time < lidar_state.t - gnss_pvt_loop_time_tolerance)
-        {
-          gnss_pvt_buf.pop_front();
-          continue;
-        }
-        if(pvt_time > lidar_state.t + gnss_pvt_loop_time_tolerance)
-          break;
-        matched_pvt = gnss_pvt_buf.front();
-        gnss_pvt_buf.pop_front();
-        break;
-      }
-    }
-    if(!matched_pvt)
-      return false;
-    
-    if(!pvt_quality_check(matched_pvt))
-      return false;
-
-    const Eigen::Vector3d lla(
-        matched_pvt->lat, matched_pvt->lon, matched_pvt->hgt);
-    const Eigen::Vector3d fix_ecef = gnss_comm::geo2ecef(lla);
-    if(!fix_ecef.allFinite())
-      return false;
-
-    if(!pvt_alignment_initialized)
-    {
-      pvt_alignment_origin_ecef = gnss_anchor_ecef;
-      pvt_R_ecef_enu =
-          gnss_comm::ecef2rotation(pvt_alignment_origin_ecef);
-      R_enu_local =
-          pvt_R_ecef_enu.transpose() * gnss_R_ecef_enu;
-      R_enu_local_prior = R_enu_local;
-      t_enu_local.setZero();
-      Tex_imu_r_alignment = p_gnss->Tex_imu_r;
-      Tex_imu_r_alignment_prior = Tex_imu_r_alignment;
-      pvt_alignment_initialized = true;
-    }
-
-    PvtAlignmentSample sample;
-    sample.timestamp =
-        gnss_comm::time2sec(matched_pvt->time) - gnss_local_time_diff;
-    sample.lidar_position = lidar_state.p;
-    sample.lidar_rotation = lidar_state.R;
-    sample.pvt_enu = pvt_R_ecef_enu.transpose() *
-        (fix_ecef - pvt_alignment_origin_ecef);
-    const double covariance_std_scale =
-        sqrt(gnss_pvt_covariance_scale);
-    const double horizontal_sigma = covariance_std_scale *
-        max(gnss_pvt_min_position_std, matched_pvt->h_acc);
-    const double vertical_sigma = covariance_std_scale *
-        max(gnss_pvt_min_position_std, matched_pvt->v_acc);
-    sample.variances <<
-        horizontal_sigma * horizontal_sigma,
-        horizontal_sigma * horizontal_sigma,
-        vertical_sigma * vertical_sigma;
-    pvt_alignment_samples.push_back(sample);
-    while(pvt_alignment_samples.size() >
-          static_cast<size_t>(pvt_alignment_max_samples))
-      pvt_alignment_samples.pop_front();
-
-    if(pvt_alignment_samples.size() <
-       static_cast<size_t>(pvt_alignment_min_samples))
-      return false;
-    const double baseline =
-        (pvt_alignment_samples.back().lidar_position -
-         pvt_alignment_samples.front().lidar_position).norm();
-    if(baseline < pvt_alignment_min_baseline)
-    {
-      ROS_INFO_THROTTLE(
-          2.0, "PVT alignment waits for motion baseline: %.2f/%.2f m "
-          "samples=%lu",
-          baseline, pvt_alignment_min_baseline,
-          static_cast<unsigned long>(pvt_alignment_samples.size()));
-      return false;
-    }
-
-    Eigen::Matrix3d optimized_rotation = R_enu_local;
-    Eigen::Vector3d optimized_translation = t_enu_local;
-    Eigen::Vector3d optimized_lever = Tex_imu_r_alignment;
-    Eigen::Matrix<double, 9, 1> last_delta =
-        Eigen::Matrix<double, 9, 1>::Zero();
-    double weighted_rms = std::numeric_limits<double>::infinity();
-    for(int iteration = 0; iteration < 10; ++iteration)
-    {
-      Eigen::Matrix<double, 9, 9> hessian =
-          Eigen::Matrix<double, 9, 9>::Zero();
-      Eigen::Matrix<double, 9, 1> gradient =
-          Eigen::Matrix<double, 9, 1>::Zero();
-      double weighted_error = 0.0;
-      int residual_dimension = 0;
-
-      for(const PvtAlignmentSample &alignment_sample :
-          pvt_alignment_samples)
-      {
-        const Eigen::Vector3d antenna_local =
-            alignment_sample.lidar_position +
-            alignment_sample.lidar_rotation * optimized_lever;
-        const Eigen::Vector3d rotated_antenna =
-            optimized_rotation * antenna_local;
-        const Eigen::Vector3d residual =
-            rotated_antenna + optimized_translation -
-            alignment_sample.pvt_enu;
-        Eigen::Matrix<double, 3, 9> jacobian;
-        jacobian.block<3, 3>(0, 0) = -hat(rotated_antenna);
-        jacobian.block<3, 3>(0, 3).setIdentity();
-        jacobian.block<3, 3>(0, 6) =
-            optimized_rotation * alignment_sample.lidar_rotation;
-
-        const Eigen::Matrix3d information =
-            alignment_sample.variances.cwiseInverse().asDiagonal();
-        const double squared_mahalanobis =
-            (residual.transpose() * information * residual)(0, 0);
-        const double mahalanobis =
-            sqrt(max(0.0, squared_mahalanobis));
-        const double robust_scale =
-            mahalanobis <= 3.0 ? 1.0 : 3.0 / mahalanobis;
-        hessian += robust_scale *
-            jacobian.transpose() * information * jacobian;
-        gradient += robust_scale *
-            jacobian.transpose() * information * residual;
-        weighted_error += robust_scale * squared_mahalanobis;
-        residual_dimension += 3;
-      }
-
-      const Eigen::Vector3d rotation_prior_residual =
-          Log(R_enu_local_prior.transpose() * optimized_rotation);
-      const double rotation_prior_information =
-          1.0 / (pvt_alignment_rotation_prior_std *
-                 pvt_alignment_rotation_prior_std);
-      const double translation_prior_information =
-          1.0 / (pvt_alignment_translation_prior_std *
-                 pvt_alignment_translation_prior_std);
-      const double lever_prior_information =
-          1.0 / (pvt_alignment_lever_prior_std *
-                 pvt_alignment_lever_prior_std);
-      hessian.block<3, 3>(0, 0).diagonal().array() +=
-          rotation_prior_information;
-      gradient.segment<3>(0) +=
-          rotation_prior_information * rotation_prior_residual;
-      hessian.block<3, 3>(3, 3).diagonal().array() +=
-          translation_prior_information;
-      gradient.segment<3>(3) +=
-          translation_prior_information * optimized_translation;
-      hessian.block<3, 3>(6, 6).diagonal().array() +=
-          lever_prior_information;
-      gradient.segment<3>(6) += lever_prior_information *
-          (optimized_lever - Tex_imu_r_alignment_prior);
-
-      Eigen::LDLT<Eigen::Matrix<double, 9, 9>> solver(hessian);
-      if(solver.info() != Eigen::Success)
-        return false;
-      last_delta = solver.solve(-gradient);
-      if(!last_delta.allFinite())
-        return false;
-
-      optimized_rotation =
-          Exp(last_delta.segment<3>(0)) * optimized_rotation;
-      optimized_translation += last_delta.segment<3>(3);
-      optimized_lever += last_delta.segment<3>(6);
-      weighted_rms =
-          sqrt(weighted_error / max(1, residual_dimension));
-      if(last_delta.segment<3>(0).norm() < 1e-6 &&
-         last_delta.segment<3>(3).norm() < 1e-4 &&
-         last_delta.segment<3>(6).norm() < 1e-4)
-        break;
-    }
-
-    R_enu_local = optimized_rotation;
-    t_enu_local = optimized_translation;
-    Tex_imu_r_alignment = optimized_lever;
-    const bool stable =
-        weighted_rms <= pvt_alignment_max_rms &&
-        last_delta.segment<3>(0).norm() < 5e-4 &&
-        last_delta.segment<3>(3).norm() < 0.02 &&
-        last_delta.segment<3>(6).norm() < 0.01;
-    pvt_alignment_stable_count =
-        stable ? pvt_alignment_stable_count + 1 : 0;
-
-    ROS_INFO(
-        "PVT spatial alignment: samples=%lu baseline=%.2f weighted_rms=%.3f "
-        "stable=%d/3 t=[%.3f %.3f %.3f] lever=[%.3f %.3f %.3f]",
-        static_cast<unsigned long>(pvt_alignment_samples.size()),
-        baseline, weighted_rms, pvt_alignment_stable_count,
-        t_enu_local.x(), t_enu_local.y(), t_enu_local.z(),
-        Tex_imu_r_alignment.x(), Tex_imu_r_alignment.y(),
-        Tex_imu_r_alignment.z());
-    if(pvt_alignment_stable_count < 3)
-      return false;
-
-    gnss_R_ecef_enu = pvt_R_ecef_enu * R_enu_local;
-    gnss_anchor_ecef =
-        pvt_alignment_origin_ecef +
-        pvt_R_ecef_enu * t_enu_local;
-    p_gnss->R_ecef_enu = gnss_R_ecef_enu;
-    p_gnss->anc_ecef = gnss_anchor_ecef;
-    p_gnss->Tex_imu_r = Tex_imu_r_alignment;
-    pvt_alignment_ready = true;
-    pending_pvt_matches.clear();
-    {
-      lock_guard<mutex> lock(mtx_pvt_loop);
-      return true;
-    }
-    ROS_INFO(
-        "PVT spatial alignment committed: t_enu_local=[%.3f %.3f %.3f] "
-        "lever=[%.3f %.3f %.3f]",
-        t_enu_local.x(), t_enu_local.y(), t_enu_local.z(),
-        p_gnss->Tex_imu_r.x(), p_gnss->Tex_imu_r.y(),
-        p_gnss->Tex_imu_r.z());
-    return true;
-  } */
-
-  // void pub_pvt_local_path()
-  // {
-  //   if(!pvt_alignment_ready)
-  //     return;
-
-  //   gnss_pvt_local_path.clear();
-  //   for(Eigen::Vector3d &pvt: gnss_pvt_ecef_path)
-  //   {
-  //     PointType pt;
-  //     auto enu = gnss_R_ecef_enu.transpose() * (pvt - gnss_anchor_ecef);
-  //     pt.x = enu.x(); pt.y = enu.y(); pt.z = enu.z();
-  //     gnss_pvt_local_path.push_back(pt);
-  //   }
-  // }
-  
   // Build the pose graph in loop closure
   void build_graph(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph, int cur_id, PGO_Edges &lp_edges, gtsam::noiseModel::Diagonal::shared_ptr default_noise, vector<int> &ids, vector<int> &stepsizes, int lpedge_enable)
   {
@@ -3404,6 +3431,7 @@ public:
     IMUST x_key;
     int buf_base = 0;
     int pending_pvt_factor_count = 0;
+    bool force_pvt_optimization = false;
 
     while(n.ok())
     {
@@ -3478,13 +3506,20 @@ public:
         gtsam::Pose3 pose3(gtsam::Rot3(xc.R), gtsam::Point3(xc.p));
         graph.addPrior(0, pose3, fixd_noise);
       }
-      if(gnss_pvt_loop_enable &&
-         add_pending_pvt_factor(
-             xc.t, cur_id, buf_base, g_pos, graph))
-        ++pending_pvt_factor_count;
-
       if(buf_base == 0) x_key = xc;
       buf_base++; stepsizes.back() += 1;
+      if(gnss_pvt_loop_enable)
+      {
+        bool alignment_just_finished = false;
+        const int added_pvt_factors =
+            collect_and_process_pvt_for_loop_pose(
+                xc, cur_id, buf_base - 1, ids, stepsizes,
+                graph, alignment_just_finished);
+        pending_pvt_factor_count += added_pvt_factors;
+        force_pvt_optimization =
+            force_pvt_optimization ||
+            (alignment_just_finished && added_pvt_factors > 0);
+      }
 
       if(bl_local.size() < win_size) continue;
       double ang = Log(x_key.R.transpose() * xc.R).norm() * 57.3;
@@ -3541,7 +3576,8 @@ public:
       vector<pair<STD, STD>> loop_std_pair;
 
       bool isGraph = false;
-      bool isOpt =
+      bool pvt_cache_cleared_for_btc = false;
+      bool isOpt = force_pvt_optimization ||
           pending_pvt_factor_count >= gnss_pvt_loop_trigger_count;
       if(isOpt)
       {
@@ -3549,6 +3585,7 @@ public:
             "Trigger pose graph optimization with %d new PVT factors.",
             pending_pvt_factor_count);
         pending_pvt_factor_count = 0;
+        force_pvt_optimization = false;
       }
       int match_num = 0;
       for(int id=0; id<=cur_id; id++)
@@ -3559,6 +3596,12 @@ public:
         {
           printf("Find Loop in session%d: %d %d\n", id, buf_base, search_result.first);
           printf("score: %lf\n", search_result.second);
+          if(!pvt_cache_cleared_for_btc)
+          {
+            clear_cached_pvt_for_btc(
+                cur_id, buf_base - 1);
+            pvt_cache_cleared_for_btc = true;
+          }
         }
 
         if(search_result.first >= 0 && search_result.second > juds[id])
@@ -4179,6 +4222,7 @@ int main(int argc, char **argv)
   pub_gnss_pvt_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_pvt_local", 100);
   pub_gnss_spp_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_spp_local", 100);
   pub_gnss_tc_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_tc_local", 100);
+  pub_lio_odom_enu = n.advertise<nav_msgs::Odometry>("/lio_odom_enu", 100);
   
   VOXEL_SLAM vs(n);
   mp = new int[vs.win_size];
