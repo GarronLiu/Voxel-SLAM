@@ -59,7 +59,7 @@ GNSS:
   dopp_std_thres: 2.0
   gnss_cp_std_thres: 1.0
   gnss_cp_time_thres: 100.0
-  gnss_sample_period: 1.0
+  gnss_sample_period: 10.0
   tight_coupling_enable: true
   tdcp_doppler_ieskf_enable: true
   pvt_loop_enable: true
