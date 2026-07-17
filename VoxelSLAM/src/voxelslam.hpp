@@ -289,11 +289,18 @@ bool sync_packages_append_GNSSRaw(
   // GnssMeasMsg没有Header，各卫星观测属于同一历元，因此使用首个观测的GPS时间。
   // 在原始GNSS数据尚未推进到当前LiDAR扫描附近时，等待新的测量消息到达。
   const double scan_end = max(p_imu.pcl_beg_time, p_imu.pcl_end_time);
-  const double target_meas_utc =
-    round(scan_end / p_gnss->gnss_sample_period) * p_gnss->gnss_sample_period;
-  const double round_time_error = fabs(scan_end - target_meas_utc);
-  const bool lidar_end_near_round_time = round_time_error <= gnss_max_delay;
-  if(gnss_enable && lidar_end_near_round_time)
+  const bool gnss_available = gnss_enable && p_gnss;
+  bool lidar_end_near_round_time = false;
+  if(gnss_available)
+  {
+    const double sample_period =
+        std::max(p_gnss->gnss_sample_period, 1e-3);
+    const double target_meas_utc =
+      round(scan_end / sample_period) * sample_period;
+    const double round_time_error = fabs(scan_end - target_meas_utc);
+    lidar_end_near_round_time = round_time_error <= gnss_max_delay;
+  }
+  if(gnss_available && lidar_end_near_round_time)
     // if(gnss_enable)
   {
     lock_guard<mutex> lock(mGnssMeasBuf);
@@ -339,7 +346,7 @@ bool sync_packages_append_GNSSRaw(
 
   // Attach one raw GNSS measurement epoch to the current LiDAR scan if available.
   matched_gnss_raw.clear();
-  if(gnss_enable && lidar_end_near_round_time)
+  if(gnss_available && lidar_end_near_round_time)
   //  if(gnss_enable)
   {
     lock_guard<mutex> lock(mGnssMeasBuf);

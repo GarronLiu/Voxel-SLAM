@@ -1,9 +1,16 @@
 <launch>
 	<arg name="rviz" default="true" />
+	<arg name="debug" default="false" />
 
 	<rosparam command="load" file="$(find voxel_slam)/config/mid360.yaml"/>
 	<param name="finish" value="false"/>
-	<node pkg="voxel_slam" type="voxelslam" name="voxelslam" output="screen" > </node>
+	<group unless="$(arg debug)">
+		<node pkg="voxel_slam" type="voxelslam" name="voxelslam" output="screen"/>
+	</group>
+	<group if="$(arg debug)">
+		<node pkg="voxel_slam" type="voxelslam" name="voxelslam" output="screen"
+			launch-prefix="xterm -hold -e gdb -q -ex run -ex &quot;thread apply all bt full&quot; --args"/>
+	</group>
   
 	<group if="$(arg rviz)">
 		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find voxel_slam)/rviz_cfg/back.rviz" />

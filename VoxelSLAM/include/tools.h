@@ -100,13 +100,12 @@ struct IMUST
   Eigen::Matrix<double, DIM, 1> operator-(const IMUST &b) 
   {
     Eigen::Matrix<double, DIM, 1> a;
+    a.setZero();
     a.block<3, 1>(0, 0) = Log(b.R.transpose() * this->R);
     a.block<3, 1>(3, 0) = this->p - b.p;
     a.block<3, 1>(6, 0) = this->v - b.v;
     a.block<3, 1>(9, 0) = this->bg - b.bg;
     a.block<3, 1>(12, 0) = this->ba - b.ba;
-    a.block<3, 1>(15, 0) = this->acc - b.acc;
-    a.block<3, 1>(18, 0) = this->omg - b.omg;
     return a;
   }
 

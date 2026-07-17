@@ -157,6 +157,18 @@ void STDescManager::GenerateSTDescs(
     pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
     std::vector<STD> &stds_vec, int id) 
 { // step1, voxelization and plane dection
+  stds_vec.clear();
+  if(input_cloud == nullptr || input_cloud->empty())
+  {
+    pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
+        new pcl::PointCloud<pcl::PointXYZINormal>);
+    plane_cloud->header.seq = id;
+    plane_cloud_vec_.push_back(plane_cloud);
+    ROS_WARN_THROTTLE(1.0,
+      "BTC descriptor skipped: empty input cloud, frame=%d", id);
+    return;
+  }
+
   std::unordered_map<BTCVOXEL_LOC, BTCOctoTree *> voxel_map;
   init_voxel_map(input_cloud, voxel_map);
   pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
@@ -191,7 +203,6 @@ void STDescManager::GenerateSTDescs(
   // vec_binary = binary_list;
 
   // step4, generate stable triangle descriptors
-  stds_vec.clear();
   generate_std(binary_list, current_frame_id_, stds_vec);
   // std::cout << "[Description] stds size:" << stds_vec.size() << std::endl;
 
@@ -349,6 +360,9 @@ void STDescManager::get_project_plane(
   }
   for (size_t i = 0; i < origin_list.size(); i++)
     origin_list[i]->id_ = 0;
+  if (origin_list.size() < 2) {
+    return;
+  }
   int current_id = 1;
   for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) 
   {
@@ -459,6 +473,9 @@ void STDescManager::get_project_plane(
 
 void STDescManager::merge_plane(std::vector<BTCPlane *> &origin_list,
                                 std::vector<BTCPlane *> &merge_plane_list) {
+  if (origin_list.empty()) {
+    return;
+  }
   if (origin_list.size() == 1) {
     merge_plane_list = origin_list;
     return;

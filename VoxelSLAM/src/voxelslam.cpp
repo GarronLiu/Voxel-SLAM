@@ -1081,6 +1081,13 @@ public:
 
         sub_navsat_fix = n.subscribe(gnss_pvt_topic, 100, &VOXEL_SLAM::navsat_fix_handler, this);
         }
+    else
+    {
+      gnss_ready = false;
+      gnss_tight_coupling_enable = false;
+      gnss_tdcp_doppler_ieskf_enable = false;
+      gnss_pvt_loop_enable = false;
+    }
     
   }
 
