@@ -740,7 +740,7 @@ public:
   mutex mtx_loop;
   deque<ScanPose*> buf_lba2loop, buf_lba2loop_tem;
   vector<Keyframe*> *keyframes;
-  int loop_detect = 0;
+  std::atomic<int> loop_detect{0};
   unordered_map<VOXEL_LOC, OctoTree*> map_loop;
   IMUST dx;
   pcl::PointCloud<PointType>::Ptr pl_kdmap;
@@ -2171,23 +2171,52 @@ public:
     double tt2 = ros::Time::now().toSec();
   }
 
-  // After detecting loop closure, refine current map and states
-  void loop_update()
+  bool local_map_update_ready() const
   {
+    if(win_count <= 0 ||
+       x_buf.size() < static_cast<size_t>(win_count) ||
+       pvec_buf.size() < static_cast<size_t>(win_count) ||
+       pcl_path.empty())
+      return false;
+
+    return std::find(
+               low_lidar_structure_buf.begin(),
+               low_lidar_structure_buf.end(), true) ==
+           low_lidar_structure_buf.end();
+  }
+
+  // After detecting loop closure, refine current map and states.
+  bool loop_update()
+  {
+    if(!local_map_update_ready() || map_loop.empty())
+      return false;
+
     printf("loop update: %zu\n", sws[0].size());
     double t1 = ros::Time::now().toSec();
+
     for(auto iter=surf_map.begin(); iter!=surf_map.end(); iter++)
     {
-      // octos_release.push_back(iter->second);
+      if(iter->second == nullptr)
+        continue;
       iter->second->tras_ptr(octos_release);
       iter->second->clear_slwd(sws[0]);
-      delete iter->second; iter->second = nullptr;
+      delete iter->second;
+      iter->second = nullptr;
     }
-    surf_map.clear(); surf_map_slide.clear();
-    surf_map = map_loop;
+    surf_map.clear();
+    surf_map_slide.clear();
+    surf_map.swap(map_loop);
     map_loop.clear();
 
-    printf("scanPoses: %zu %zu %zu %d %d %zu\n", scanPoses->size(), buf_lba2loop.size(), x_buf.size(), win_base, win_count, sws[0].size());
+    vector<ScanPose*> pending_loop_poses;
+    {
+      lock_guard<mutex> lock(mtx_loop);
+      pending_loop_poses.assign(
+          buf_lba2loop.begin(), buf_lba2loop.end());
+    }
+    printf("scanPoses: %zu %zu %zu %d %d %zu\n",
+           scanPoses->size(), pending_loop_poses.size(), x_buf.size(),
+           win_base, win_count, sws[0].size());
     int blsize = scanPoses->size();
     PointType ap = pcl_path[0];
     pcl_path.clear();
@@ -2200,8 +2229,10 @@ public:
       pcl_path.push_back(ap);
     }
 
-    for(ScanPose *bl: buf_lba2loop)
+    for(ScanPose *bl: pending_loop_poses)
     {
+      if(bl == nullptr)
+        continue;
       bl->update(dx);
       ap.x = bl->x.p[0];
       ap.y = bl->x.p[1];
@@ -2232,8 +2263,10 @@ public:
     for(int i=0; i<win_size; i++)
       mp[i] = i;
 
-    for(ScanPose *bl: buf_lba2loop)
+    for(ScanPose *bl: pending_loop_poses)
     {
+      if(bl == nullptr || !bl->pvec)
+        continue;
       IMUST xx = bl->x;
       PVec pvec_tem = *(bl->pvec);
       for(pointVar &pv: pvec_tem)
@@ -2254,9 +2287,10 @@ public:
       iter->second->recut(win_count, x_buf, sws[0]);
 
     if(g_update == 1) g_update = 2;
-    loop_detect = 0;
+    loop_detect.store(0, std::memory_order_release);
     double t2 = ros::Time::now().toSec();
     printf("loop head: %lf %zu\n", t2 - t1, sws[0].size());
+    return true;
   }
 
   // load the previous keyframe in the local voxel map
@@ -2636,9 +2670,28 @@ public:
     Eigen::MatrixXd hess;
     while(n.ok())
     {
-      if(loop_detect == 1)
+      if(loop_detect.load(std::memory_order_acquire) == 1)
       {
-        loop_update(); last_pos = x_curr.p; jour = 0;
+        if(map_loop.empty())
+        {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "PGO local-map update skipped because the rebuilt map is "
+              "empty; preserving the current lidar map.");
+          loop_detect.store(0, std::memory_order_release);
+        }
+        else if(local_map_update_ready() && loop_update())
+        {
+          last_pos = x_curr.p;
+          jour = 0;
+        }
+        else
+        {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "PGO local-map update deferred until the lidar/local-BA "
+              "window is structurally valid.");
+        }
       }
       
       n.param<bool>("finish", is_finish, false);
@@ -3377,7 +3430,8 @@ public:
   int collect_and_process_pvt_for_loop_pose(
       const IMUST &pose, int session_id, int pose_id,
       const vector<int> &ids, const vector<int> &stepsizes,
-      gtsam::NonlinearFactorGraph &graph, bool &alignment_just_finished)
+      gtsam::NonlinearFactorGraph &graph, bool &alignment_just_finished,
+      bool add_pvt_factors)
   {
     alignment_just_finished = false;
     PvtAlignmentSample current_pose;
@@ -3422,7 +3476,7 @@ public:
     {
       const bool appended =
           append_pvt_alignment_sample(match.first, match.second);
-      if(appended && pvt_alignment_ready &&
+      if(appended && pvt_alignment_ready && add_pvt_factors &&
          add_aligned_pvt_factor(
              pvt_alignment_samples.back(), ids, stepsizes, graph))
         ++added_factors;
@@ -3433,10 +3487,13 @@ public:
       alignment_just_finished = true;
       have_last_pvt_loop_position = false;
       last_pvt_loop_position.setZero();
-      for(const PvtAlignmentSample &sample : pvt_alignment_samples)
+      if(add_pvt_factors)
       {
-        if(add_aligned_pvt_factor(sample, ids, stepsizes, graph))
-          ++added_factors;
+        for(const PvtAlignmentSample &sample : pvt_alignment_samples)
+        {
+          if(add_aligned_pvt_factor(sample, ids, stepsizes, graph))
+            ++added_factors;
+        }
       }
       ROS_INFO(
           "PVT loop alignment committed; restored dt<=%.3f s and "
@@ -3645,12 +3702,18 @@ public:
         stepsizes.clear(); stepsizes.push_back(0); stepsizes.push_back(0);
       }
 
-      if(is_finish && buf_lba2loop.empty())
+      bool loop_queue_empty = false;
+      {
+        lock_guard<mutex> lock(mtx_loop);
+        loop_queue_empty = buf_lba2loop.empty();
+      }
+      if(is_finish && loop_queue_empty)
       {
         break;
       }
 
-      if(buf_lba2loop.empty() || loop_detect == 1)
+      if(loop_queue_empty ||
+         loop_detect.load(std::memory_order_acquire) == 1)
       {
         sleep(0.01); continue;
       }
@@ -3685,13 +3748,13 @@ public:
       }
       if(buf_base == 0) x_key = xc;
       buf_base++; stepsizes.back() += 1;
-      if(gnss_pvt_loop_enable)
       {
         bool alignment_just_finished = false;
         const int added_pvt_factors =
             collect_and_process_pvt_for_loop_pose(
                 xc, cur_id, buf_base - 1, ids, stepsizes,
-                graph, alignment_just_finished);
+                graph, alignment_just_finished,
+                gnss_pvt_loop_enable);
         pending_pvt_factor_count += added_pvt_factors;
         force_pvt_optimization =
             force_pvt_optimization ||
@@ -3754,8 +3817,10 @@ public:
 
       bool isGraph = false;
       bool pvt_cache_cleared_for_btc = false;
-      bool isOpt = force_pvt_optimization ||
+      const bool pvt_requested_optimization =
+          force_pvt_optimization ||
           pending_pvt_factor_count >= gnss_pvt_loop_trigger_count;
+      bool isOpt = pvt_requested_optimization;
       if(isOpt)
       {
         ROS_INFO(
@@ -3874,6 +3939,8 @@ public:
 
       if(isOpt)
       {
+        const bool geometric_loop_optimization =
+            isGraph || match_num > 0;
         gtsam::ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.01;
         parameters.relinearizeSkip = 1;
@@ -3887,7 +3954,6 @@ public:
         IMUST x1 = scanPoses->at(buf_base-1)->x;
         int idsize = ids.size();
 
-        history_kfsize = 0;
         for(int ii=0; ii<idsize; ii++)
         {
           int tip = ids[ii];
@@ -3915,44 +3981,55 @@ public:
         dx.R = x3.R * x1.R.transpose();
         x_key = x3;
 
-        PVec pvec_tem;
-        int subsize = keyframes->size();
-        int init_num = 5;
-        for(int i=subsize-init_num; i<subsize; i++)
+        if(geometric_loop_optimization)
         {
-          if(i < 0) continue;
-          Keyframe &sp = *(keyframes->at(i));
-          sp.exist = 0;
-          pvec_tem.reserve(sp.plptr->size());
-          pointVar pv; pv.var.setZero();
-          for(PointType &ap: sp.plptr->points)
+          history_kfsize = 0;
+          PVec pvec_tem;
+          int subsize = keyframes->size();
+          int init_num = 5;
+          for(int i=subsize-init_num; i<subsize; i++)
           {
-            pv.pnt << ap.x, ap.y, ap.z;
-            pv.pnt = sp.x0.R * pv.pnt + sp.x0.p;
-            for(int j=0; j<3; j++)
-              pv.var(j, j) = ap.normal[j];
-            pvec_tem.push_back(pv);
-          }
-          cut_voxel(map_loop, pvec_tem, win_size, 0);
-        }
-
-        if(subsize > init_num)
-        {
-          pl_kdmap->clear();
-          for(int i=0; i<subsize-init_num; i++)
-          {
-            Keyframe &kf = *(keyframes->at(i));
-            kf.exist = 1;
-            PointType pp;
-            pp.x = kf.x0.p[0]; pp.y = kf.x0.p[1]; pp.z = kf.x0.p[2];
-            pp.intensity = cur_id; pp.curvature = i;
-            pl_kdmap->push_back(pp);
+            if(i < 0) continue;
+            Keyframe &sp = *(keyframes->at(i));
+            sp.exist = 0;
+            pvec_tem.clear();
+            pvec_tem.reserve(sp.plptr->size());
+            pointVar pv; pv.var.setZero();
+            for(PointType &ap: sp.plptr->points)
+            {
+              pv.pnt << ap.x, ap.y, ap.z;
+              pv.pnt = sp.x0.R * pv.pnt + sp.x0.p;
+              for(int j=0; j<3; j++)
+                pv.var(j, j) = ap.normal[j];
+              pvec_tem.push_back(pv);
+            }
+            cut_voxel(map_loop, pvec_tem, win_size, 0);
           }
 
-          kd_keyframes.setInputCloud(pl_kdmap);
-          history_kfsize = pl_kdmap->size();
+          if(subsize > init_num)
+          {
+            pl_kdmap->clear();
+            for(int i=0; i<subsize-init_num; i++)
+            {
+              Keyframe &kf = *(keyframes->at(i));
+              kf.exist = 1;
+              PointType pp;
+              pp.x = kf.x0.p[0]; pp.y = kf.x0.p[1]; pp.z = kf.x0.p[2];
+              pp.intensity = cur_id; pp.curvature = i;
+              pl_kdmap->push_back(pp);
+            }
+
+            kd_keyframes.setInputCloud(pl_kdmap);
+            history_kfsize = pl_kdmap->size();
+          }
+          loop_detect.store(1, std::memory_order_release);
         }
-        loop_detect = 1;
+        else if(pvt_requested_optimization)
+        {
+          ROS_INFO(
+              "PVT-only pose graph optimization completed; skipped local "
+              "voxel-map replacement (no geometric loop constraint).");
+        }
 
         vector<int> ids2 = ids; ids2.pop_back();
         ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids2);

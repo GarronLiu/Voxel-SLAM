@@ -6,6 +6,7 @@
 #include "feature_point.hpp"
 #include "loop_refine.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <deque>
