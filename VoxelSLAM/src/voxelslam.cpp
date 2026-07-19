@@ -1984,16 +1984,28 @@ public:
       {
         p_gnss->para_rcv_ddt[0] +=
             last_gnss_normal.clock_drift_correction;
+        for(int system = 0; system < 4; ++system)
+          p_gnss->para_rcv_dt[system] +=
+              last_gnss_normal.clock_bias_correction(system);
         ROS_INFO("LIO+GNSS ESIKF: lidar_hessian=%s lidar_residual=%s "
-                 "matches=%d retained_directions=%d/6 tdcp=%d doppler=%d "
-                 "chi2_rejected=%d ddt_correction=%.4f",
+                 "matches=%d retained_directions=%d/6 psr=%d "
+                 "psr_chi2_rejected=%d tdcp=%d doppler=%d "
+                 "chi2_rejected=%d "
+                 "dt_correction=[%.3f %.3f %.3f %.3f] "
+                 "ddt_correction=%.4f",
           lidar_hessian_well_conditioned ? "well-conditioned" : "ill-conditioned",
           lidar_hessian_well_conditioned ? "full" : "projected",
           match_num,
           lidar_retained_directions,
+          last_gnss_normal.psr_accepted,
+          diag.psr_chi_square_rejected,
           last_gnss_normal.tdcp_accepted,
           last_gnss_normal.doppler_accepted,
           last_gnss_normal.chi_square_rejected,
+          last_gnss_normal.clock_bias_correction(0),
+          last_gnss_normal.clock_bias_correction(1),
+          last_gnss_normal.clock_bias_correction(2),
+          last_gnss_normal.clock_bias_correction(3),
           last_gnss_normal.clock_drift_correction);
       }
       else
@@ -2001,6 +2013,7 @@ public:
         ROS_WARN("LIO+GNSS ESIKF skipped: prepare=%s raw=%d cp=%d common_cp=%d "
                  "dt=%.3f/max=%.3f "
                  "doppler[candidate=%d invalid=%d gross=%d] "
+                 "psr[candidate=%d invalid=%d gross=%d chi2=%d] "
                  "tdcp[candidate=%d geometry=%d elevation=%d gross=%d] "
                  "chi2=%d required[tdcp=4 doppler=%lu]",
           p_gnss->ieskfPrepareStatusString(),
@@ -2008,6 +2021,8 @@ public:
           diag.common_carrier_phase, diag.epoch_time_gap,
           diag.maximum_time_gap, diag.doppler_candidates,
           diag.doppler_invalid, diag.doppler_gross_rejected,
+          diag.psr_candidates, diag.psr_invalid,
+          diag.psr_gross_rejected, diag.psr_chi_square_rejected,
           diag.tdcp_candidates, diag.tdcp_geometry_rejected,
           diag.tdcp_elevation_rejected, diag.tdcp_gross_rejected,
           diag.chi_square_rejected,

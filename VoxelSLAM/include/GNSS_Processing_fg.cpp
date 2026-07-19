@@ -628,6 +628,10 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
   ieskf_filter_diagnostics.doppler_candidates = 0;
   ieskf_filter_diagnostics.doppler_invalid = 0;
   ieskf_filter_diagnostics.doppler_gross_rejected = 0;
+  ieskf_filter_diagnostics.psr_candidates = 0;
+  ieskf_filter_diagnostics.psr_invalid = 0;
+  ieskf_filter_diagnostics.psr_gross_rejected = 0;
+  ieskf_filter_diagnostics.psr_chi_square_rejected = 0;
   ieskf_filter_diagnostics.tdcp_candidates = 0;
   ieskf_filter_diagnostics.tdcp_geometry_rejected = 0;
   ieskf_filter_diagnostics.tdcp_elevation_rejected = 0;
@@ -671,15 +675,23 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
 
   struct ResidualCandidate
   {
+    enum class Type
+    {
+      Doppler,
+      Tdcp,
+      Pseudorange
+    };
+
     double residual = 0.0;
     double sigma = 1.0;
     double clock_jacobian = 0.0;
+    int clock_bias_index = -1;
     Eigen::Matrix<double, 1, 6> state_jacobian =
         Eigen::Matrix<double, 1, 6>::Zero();
-    bool is_tdcp = false;
+    Type type = Type::Doppler;
   };
   std::vector<ResidualCandidate> candidates;
-  candidates.reserve(2 * gnss_meas_buf[0].size());
+  candidates.reserve(3 * gnss_meas_buf[0].size());
 
   for (size_t i = 0; i < gnss_meas_buf[0].size(); ++i)
   {
@@ -724,6 +736,84 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
   }
 
   const vector<double> &iono = p_assign->latest_gnss_iono_params;
+  Eigen::Matrix<double, 7, 1> pseudorange_state;
+  pseudorange_state.head<3>() = receiver_ecef;
+  for (int system = 0; system < 4; ++system)
+    pseudorange_state(3 + system) = para_rcv_dt[system];
+
+  Eigen::VectorXd pseudorange_residual;
+  Eigen::MatrixXd pseudorange_jacobian;
+  std::vector<Eigen::Vector2d> atmospheric_delay;
+  std::vector<Eigen::Vector2d> satellite_azel;
+  psr_res(pseudorange_state, gnss_meas_buf[0],
+          tdcp_ieskf_current_states, iono,
+          pseudorange_residual, pseudorange_jacobian,
+          atmospheric_delay, satellite_azel);
+
+  for (size_t i = 0; i < gnss_meas_buf[0].size(); ++i)
+  {
+    const ObsPtr &observation = gnss_meas_buf[0][i];
+    if (!observation ||
+        i >= static_cast<size_t>(pseudorange_residual.size()) ||
+        i >= static_cast<size_t>(pseudorange_jacobian.rows()))
+    {
+      ++ieskf_filter_diagnostics.psr_invalid;
+      continue;
+    }
+
+    int l1_idx = -1;
+    L1_freq(observation, &l1_idx);
+    if (l1_idx < 0 ||
+        l1_idx >= static_cast<int>(observation->psr.size()) ||
+        l1_idx >= static_cast<int>(observation->psr_std.size()) ||
+        !std::isfinite(observation->psr[l1_idx]) ||
+        observation->psr[l1_idx] <= 0.0 ||
+        !std::isfinite(observation->psr_std[l1_idx]))
+    {
+      ++ieskf_filter_diagnostics.psr_invalid;
+      continue;
+    }
+
+    const uint32_t system = satsys(observation->sat, nullptr);
+    const auto system_index = sys2idx.find(system);
+    if (system_index == sys2idx.end() || system_index->second >= 4)
+    {
+      ++ieskf_filter_diagnostics.psr_invalid;
+      continue;
+    }
+
+    ++ieskf_filter_diagnostics.psr_candidates;
+    double residual = pseudorange_residual(i);
+    if (psr_meas_hatch_filter.size() == gnss_meas_buf[0].size() &&
+        std::isfinite(psr_meas_hatch_filter[i]) &&
+        psr_meas_hatch_filter[i] > 0.0)
+    {
+      // psr_res uses the raw measurement. Shift its residual to the
+      // carrier-smoothed pseudorange selected by processGNSSBase.
+      residual += observation->psr[l1_idx] -
+          psr_meas_hatch_filter[i];
+    }
+    const double sigma =
+        std::max(0.5, observation->psr_std[l1_idx]);
+    const Eigen::RowVector3d position_jacobian_ecef =
+        pseudorange_jacobian.block<1, 3>(i, 0);
+    if (!std::isfinite(residual) || !std::isfinite(sigma) ||
+        !position_jacobian_ecef.allFinite())
+    {
+      ++ieskf_filter_diagnostics.psr_invalid;
+      continue;
+    }
+
+    ResidualCandidate candidate;
+    candidate.residual = residual;
+    candidate.sigma = sigma;
+    candidate.clock_bias_index = system_index->second;
+    candidate.state_jacobian.block<1, 3>(0, 0) =
+        position_jacobian_ecef * R_ecef_enu;
+    candidate.type = ResidualCandidate::Type::Pseudorange;
+    candidates.push_back(candidate);
+  }
+
   for (const auto &sat : tdcp_ieskf_current_sats)
   {
     const auto previous = tdcp_ieskf_prev_sats.find(sat.first);
@@ -805,7 +895,7 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
     candidate.sigma = sigma;
     candidate.clock_jacobian = dt;
     candidate.state_jacobian = jacobian;
-    candidate.is_tdcp = true;
+    candidate.type = ResidualCandidate::Type::Tdcp;
     candidates.push_back(candidate);
   }
 
@@ -815,7 +905,7 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
   clock_corrections.reserve(candidates.size());
   for (const ResidualCandidate &candidate : candidates)
   {
-    if (!candidate.is_tdcp &&
+    if (candidate.type == ResidualCandidate::Type::Doppler &&
         std::fabs(candidate.clock_jacobian) > 1e-8)
       clock_corrections.push_back(
           -candidate.residual / candidate.clock_jacobian);
@@ -829,50 +919,118 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
                    clock_corrections.end());
   normal.clock_drift_correction = clock_corrections[median_index];
 
+  std::array<std::vector<double>, 4> clock_bias_corrections;
+  for (const ResidualCandidate &candidate : candidates)
+  {
+    if (candidate.type == ResidualCandidate::Type::Pseudorange &&
+        candidate.clock_bias_index >= 0 &&
+        candidate.clock_bias_index < 4)
+      clock_bias_corrections[candidate.clock_bias_index].push_back(
+          -candidate.residual);
+  }
+  for (int system = 0; system < 4; ++system)
+  {
+    std::vector<double> &corrections = clock_bias_corrections[system];
+    if (corrections.empty())
+      continue;
+    const size_t index = corrections.size() / 2;
+    std::nth_element(corrections.begin(), corrections.begin() + index,
+                     corrections.end());
+    normal.clock_bias_correction(system) = corrections[index];
+  }
+
   Eigen::Matrix<double, 6, 6> state_hessian =
       Eigen::Matrix<double, 6, 6>::Zero();
   Eigen::Matrix<double, 6, 1> state_gradient =
       Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> state_clock_hessian =
       Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 4> state_bias_hessian =
+      Eigen::Matrix<double, 6, 4>::Zero();
+  Eigen::Matrix<double, 4, 1> bias_hessian =
+      Eigen::Matrix<double, 4, 1>::Zero();
+  Eigen::Matrix<double, 4, 1> bias_gradient =
+      Eigen::Matrix<double, 4, 1>::Zero();
   double clock_hessian = 0.0;
   double clock_gradient = 0.0;
+  std::array<std::vector<double>, 4> accepted_clock_bias_corrections;
   for (const ResidualCandidate &candidate : candidates)
   {
-    const double corrected_residual =
-        candidate.residual +
-        candidate.clock_jacobian * normal.clock_drift_correction;
+    double corrected_residual = candidate.residual;
+    if (candidate.type == ResidualCandidate::Type::Pseudorange)
+      corrected_residual +=
+          normal.clock_bias_correction(candidate.clock_bias_index);
+    else
+      corrected_residual +=
+          candidate.clock_jacobian * normal.clock_drift_correction;
+
+    if (candidate.type == ResidualCandidate::Type::Pseudorange &&
+        std::fabs(corrected_residual) >
+            std::max(30.0, 8.0 * candidate.sigma))
+    {
+      ++ieskf_filter_diagnostics.psr_gross_rejected;
+      continue;
+    }
     if (!accept_residual(corrected_residual,
                          candidate.state_jacobian,
                          candidate.sigma))
     {
       ++normal.chi_square_rejected;
+      if (candidate.type == ResidualCandidate::Type::Pseudorange)
+        ++ieskf_filter_diagnostics.psr_chi_square_rejected;
       continue;
     }
 
     const double weight = 1.0 / (candidate.sigma * candidate.sigma);
-    const double clock_jacobian =
-        candidate.is_tdcp ? 0.0 : candidate.clock_jacobian;
     state_hessian += weight *
         candidate.state_jacobian.transpose() * candidate.state_jacobian;
     state_gradient -= weight *
         candidate.state_jacobian.transpose() * corrected_residual;
-    state_clock_hessian += weight *
-        candidate.state_jacobian.transpose() * clock_jacobian;
-    clock_hessian += weight *
-        clock_jacobian * clock_jacobian;
-    clock_gradient -= weight *
-        clock_jacobian * corrected_residual;
-    if (candidate.is_tdcp)
+    if (candidate.type == ResidualCandidate::Type::Doppler)
+    {
+      const double clock_jacobian = candidate.clock_jacobian;
+      state_clock_hessian += weight *
+          candidate.state_jacobian.transpose() * clock_jacobian;
+      clock_hessian += weight * clock_jacobian * clock_jacobian;
+      clock_gradient -= weight * clock_jacobian * corrected_residual;
+    }
+    else if (candidate.type == ResidualCandidate::Type::Pseudorange)
+    {
+      const int system = candidate.clock_bias_index;
+      state_bias_hessian.col(system) +=
+          weight * candidate.state_jacobian.transpose();
+      bias_hessian(system) += weight;
+      bias_gradient(system) -= weight * corrected_residual;
+      accepted_clock_bias_corrections[system].push_back(
+          -candidate.residual);
+    }
+
+    if (candidate.type == ResidualCandidate::Type::Tdcp)
       ++normal.tdcp_accepted;
-    else
+    else if (candidate.type == ResidualCandidate::Type::Doppler)
       ++normal.doppler_accepted;
+    else
+      ++normal.psr_accepted;
   }
 
   normal.valid =
       normal.tdcp_accepted >= 4 &&
       normal.doppler_accepted >= static_cast<int>(min_obs) &&
       clock_hessian > 1e-12;
+  for (int system = 0; system < 4; ++system)
+  {
+    std::vector<double> &corrections =
+        accepted_clock_bias_corrections[system];
+    if (corrections.empty())
+    {
+      normal.clock_bias_correction(system) = 0.0;
+      continue;
+    }
+    const size_t index = corrections.size() / 2;
+    std::nth_element(corrections.begin(), corrections.begin() + index,
+                     corrections.end());
+    normal.clock_bias_correction(system) = corrections[index];
+  }
   if (normal.valid)
   {
     normal.hessian = state_hessian -
@@ -880,6 +1038,20 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
         clock_hessian;
     normal.gradient = state_gradient -
         state_clock_hessian * (clock_gradient / clock_hessian);
+    for (int system = 0; system < 4; ++system)
+    {
+      if (bias_hessian(system) <= 1e-12)
+        continue;
+      normal.hessian -=
+          state_bias_hessian.col(system) *
+          state_bias_hessian.col(system).transpose() /
+          bias_hessian(system);
+      normal.gradient -=
+          state_bias_hessian.col(system) *
+          (bias_gradient(system) / bias_hessian(system));
+    }
+    normal.hessian =
+        0.5 * (normal.hessian + normal.hessian.transpose());
   }
   ieskf_filter_diagnostics.chi_square_rejected =
       normal.chi_square_rejected;

@@ -38,6 +38,7 @@
 #include "GNSS_Initialization.h"
 #include "GNSS_Assignment.h"
 
+#include <array>
 #include <deque>
 #include <mutex>
 #include <pcl/registration/icp.h>
@@ -56,9 +57,12 @@ class GNSSProcess
         Eigen::Matrix<double, 6, 6>::Zero();
     Eigen::Matrix<double, 6, 1> gradient =
         Eigen::Matrix<double, 6, 1>::Zero();
+    int psr_accepted = 0;
     int tdcp_accepted = 0;
     int doppler_accepted = 0;
     int chi_square_rejected = 0;
+    Eigen::Matrix<double, 4, 1> clock_bias_correction =
+        Eigen::Matrix<double, 4, 1>::Zero();
     double clock_drift_correction = 0.0;
     bool valid = false;
   };
@@ -89,6 +93,10 @@ class GNSSProcess
     int doppler_candidates = 0;
     int doppler_invalid = 0;
     int doppler_gross_rejected = 0;
+    int psr_candidates = 0;
+    int psr_invalid = 0;
+    int psr_gross_rejected = 0;
+    int psr_chi_square_rejected = 0;
     int tdcp_candidates = 0;
     int tdcp_geometry_rejected = 0;
     int tdcp_elevation_rejected = 0;
