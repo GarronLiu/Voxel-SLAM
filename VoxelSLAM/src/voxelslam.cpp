@@ -722,11 +722,16 @@ public:
   IMUEKF odom_ekf;
   unordered_map<VOXEL_LOC, OctoTree*> surf_map, surf_map_slide;
   double down_size;
+  double lidar_max_range = 0.0;
+  int min_lidar_match_num = 50;
+  double lidar_max_condition_number = 1e4;
+  double lidar_min_normalized_eigenvalue = 1e-4;
 
   int win_size;
   vector<IMUST> x_buf;
   vector<PVecPtr> pvec_buf;
   deque<IMU_PRE*> imu_pre_buf;
+  deque<bool> low_lidar_structure_buf;
   int win_count = 0, win_base = 0;
   vector<vector<SlideWindow*>> sws;
 
@@ -791,8 +796,11 @@ public:
   double gnss_lio_sqrt_info_min = 0.1;
   double gnss_lio_sqrt_info_max = 30.0;
   double gnss_lio_sqrt_info_scale = 1.0;
-  bool gnss_tight_coupling_enable = false;
   bool gnss_tdcp_doppler_ieskf_enable = false;
+  bool last_lidar_hessian_well_conditioned = false;
+  bool last_gnss_ieskf_update_valid = false;
+  int last_lidar_match_num = 0;
+  int last_lidar_retained_directions = 0;
   bool gnss_pvt_loop_enable = true;
   double gnss_pvt_loop_min_distance = 5.0;
   double gnss_pvt_loop_time_tolerance = 0.2;
@@ -910,6 +918,7 @@ public:
     n.param<string>("General/save_path", savepath, "");
     n.param<int>("General/lidar_type", feat.lidar_type, 0);
     n.param<double>("General/blind", feat.blind, 0.1);
+    n.param<double>("General/lidar_max_range", lidar_max_range, 0.0);
     n.param<int>("General/point_filter_num", feat.point_filter_num, 3);
     n.param<vector<double>>("General/extrinsic_tran", vecT, vector<double>());
     n.param<vector<double>>("General/extrinsic_rota", vecR, vector<double>());
@@ -933,7 +942,18 @@ public:
     n.param<double>("Odometry/voxel_size", voxel_size, 1);
     n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
     n.param<int>("Odometry/degrade_bound", degrade_bound, 10);
+    n.param<int>("Odometry/min_lidar_match_num", min_lidar_match_num, 50);
+    n.param<double>("Odometry/lidar_max_condition_number",
+                    lidar_max_condition_number, 1e4);
+    n.param<double>("Odometry/lidar_min_normalized_eigenvalue",
+                    lidar_min_normalized_eigenvalue, 1e-4);
     n.param<int>("Odometry/point_notime", point_notime, 0);
+    lidar_max_range = std::max(0.0, lidar_max_range);
+    min_lidar_match_num = std::max(1, min_lidar_match_num);
+    lidar_max_condition_number =
+        std::max(1.0, lidar_max_condition_number);
+    lidar_min_normalized_eigenvalue =
+        std::max(0.0, lidar_min_normalized_eigenvalue);
     odom_ekf.point_notime = point_notime;
 
     feat.blind = feat.blind * feat.blind;
@@ -1014,7 +1034,6 @@ public:
         p_gnss->min_obs = static_cast<size_t>(max(gnss_min_obs, 4));
         n.param<double>("GNSS/min_hor_vel", gnss_min_hor_vel, 0.3);
         p_gnss->min_hor_vel = gnss_min_hor_vel;
-        n.param<bool>("GNSS/tight_coupling_enable", gnss_tight_coupling_enable, true);
         n.param<bool>("GNSS/tdcp_doppler_ieskf_enable", gnss_tdcp_doppler_ieskf_enable, false);
         n.param<bool>("GNSS/pvt_loop_enable", gnss_pvt_loop_enable, true);
         n.param<double>("GNSS/pvt_loop_min_distance", gnss_pvt_loop_min_distance, 5.0);
@@ -1084,7 +1103,6 @@ public:
     else
     {
       gnss_ready = false;
-      gnss_tight_coupling_enable = false;
       gnss_tdcp_doppler_ieskf_enable = false;
       gnss_pvt_loop_enable = false;
     }
@@ -1739,6 +1757,10 @@ public:
   bool lio_state_estimation(PVecPtr pptr, bool use_gnss_epoch)
   {
     IMUST x_prop = x_curr;
+    last_lidar_hessian_well_conditioned = false;
+    last_gnss_ieskf_update_valid = false;
+    last_lidar_match_num = 0;
+    last_lidar_retained_directions = 0;
 
     const int num_max_iter = 4;
     bool EKF_stop_flg = 0, flg_EKF_converged = 0;
@@ -1757,6 +1779,7 @@ public:
         use_gnss_epoch && p_gnss && p_gnss->gnss_ready &&
         p_gnss->prepareTdcpDopplerIeskf(x_curr);
     bool lidar_hessian_well_conditioned = false;
+    int lidar_retained_directions = 0;
     bool gnss_residuals_used = false;
     GNSSProcess::IeskfNormalEquation last_gnss_normal;
     for(int iterCount=0; iterCount<num_max_iter; iterCount++)
@@ -1813,24 +1836,74 @@ public:
           hessian_scale.asDiagonal() * HTH * hessian_scale.asDiagonal();
       Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>>
           hessian_solver(normalized_hessian);
+      Eigen::Matrix<double, 6, 6> effective_lidar_hessian = HTH;
+      Eigen::Matrix<double, 6, 1> effective_lidar_gradient = HTz;
       if(hessian_solver.info() == Eigen::Success)
       {
         const Eigen::Matrix<double, 6, 1> eigenvalues =
             hessian_solver.eigenvalues();
+        const double maximum_eigenvalue =
+            std::max(0.0, eigenvalues(5));
+        const double eigenvalue_cutoff =
+            std::max(lidar_min_normalized_eigenvalue,
+                     maximum_eigenvalue /
+                     lidar_max_condition_number);
+        Eigen::Matrix<double, 6, 1> retained_eigenvalues;
+        Eigen::Matrix<double, 6, 1> observable_mask;
+        lidar_retained_directions = 0;
+        for(int i = 0; i < 6; ++i)
+        {
+          const bool observable =
+              eigenvalues(i) >= eigenvalue_cutoff &&
+              eigenvalues(i) > 0.0;
+          retained_eigenvalues(i) =
+              observable ? eigenvalues(i) : 0.0;
+          observable_mask(i) = observable ? 1.0 : 0.0;
+          if(observable)
+            ++lidar_retained_directions;
+        }
         lidar_hessian_well_conditioned =
-            eigenvalues(0) > 1e-4 &&
-            eigenvalues(5) / eigenvalues(0) < 1e6;
+            match_num >= min_lidar_match_num &&
+            lidar_retained_directions == 6;
+
+        if(!lidar_hessian_well_conditioned)
+        {
+          const Eigen::Matrix<double, 6, 6> eigenvectors =
+              hessian_solver.eigenvectors();
+          const Eigen::Matrix<double, 6, 6> observable_projector =
+              eigenvectors * observable_mask.asDiagonal() *
+              eigenvectors.transpose();
+          Eigen::Matrix<double, 6, 1> inverse_hessian_scale;
+          for(int i = 0; i < 6; ++i)
+            inverse_hessian_scale(i) = 1.0 / hessian_scale(i);
+
+          effective_lidar_hessian =
+              inverse_hessian_scale.asDiagonal() *
+              eigenvectors * retained_eigenvalues.asDiagonal() *
+              eigenvectors.transpose() *
+              inverse_hessian_scale.asDiagonal();
+          effective_lidar_gradient =
+              inverse_hessian_scale.asDiagonal() *
+              observable_projector *
+              hessian_scale.asDiagonal() * HTz;
+          effective_lidar_hessian =
+              0.5 * (effective_lidar_hessian +
+                     effective_lidar_hessian.transpose());
+        }
       }
       else
       {
         lidar_hessian_well_conditioned = false;
+        lidar_retained_directions = 0;
+        effective_lidar_hessian.setZero();
+        effective_lidar_gradient.setZero();
       }
 
       H_T_H.setZero();
-      H_T_H.block<6, 6>(0, 0) = HTH;
+      H_T_H.block<6, 6>(0, 0) = effective_lidar_hessian;
       Eigen::Matrix<double, DIM, 1> full_HTz =
           Eigen::Matrix<double, DIM, 1>::Zero();
-      full_HTz.block<6, 1>(0, 0) = HTz;
+      full_HTz.block<6, 1>(0, 0) = effective_lidar_gradient;
 
       GNSSProcess::IeskfNormalEquation gnss_normal;
       if(gnss_epoch_prepared)
@@ -1911,9 +1984,13 @@ public:
       {
         p_gnss->para_rcv_ddt[0] +=
             last_gnss_normal.clock_drift_correction;
-        ROS_INFO("LIO+GNSS ESIKF: lidar_hessian=%s tdcp=%d doppler=%d "
+        ROS_INFO("LIO+GNSS ESIKF: lidar_hessian=%s lidar_residual=%s "
+                 "matches=%d retained_directions=%d/6 tdcp=%d doppler=%d "
                  "chi2_rejected=%d ddt_correction=%.4f",
           lidar_hessian_well_conditioned ? "well-conditioned" : "ill-conditioned",
+          lidar_hessian_well_conditioned ? "full" : "projected",
+          match_num,
+          lidar_retained_directions,
           last_gnss_normal.tdcp_accepted,
           last_gnss_normal.doppler_accepted,
           last_gnss_normal.chi_square_rejected,
@@ -1937,6 +2014,12 @@ public:
           static_cast<unsigned long>(p_gnss->min_obs));
       }
     }
+
+    last_lidar_hessian_well_conditioned =
+        lidar_hessian_well_conditioned;
+    last_gnss_ieskf_update_valid = gnss_residuals_used;
+    last_lidar_match_num = match_num;
+    last_lidar_retained_directions = lidar_retained_directions;
 
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
     Eigen::Vector3d evalue = saes.eigenvalues();
@@ -2298,6 +2381,7 @@ public:
     for(int i=0; i<imu_pre_buf.size(); i++)
       delete imu_pre_buf[i];
     x_buf.clear(); pvec_buf.clear(); imu_pre_buf.clear();
+    low_lidar_structure_buf.clear();
     
     gnss_ready = false;
     gnss_candidate_initialized = false;
@@ -2652,6 +2736,7 @@ public:
         if(init == 1)
         {
           motion_init_flag = 0;
+          low_lidar_structure_buf.assign(win_count, false);
         }
         else
         {
@@ -2665,10 +2750,39 @@ public:
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
           continue;
 
-        pcl::PointCloud<PointType> pl_down = *pcl_curr;
-        down_sampling_voxel(pl_down, down_size);
+        if(lidar_max_range > 0.0)
+        {
+          const size_t original_size = pcl_curr->size();
+          const double max_range_sq =
+              lidar_max_range * lidar_max_range;
+          pcl_curr->points.erase(
+              std::remove_if(
+                  pcl_curr->points.begin(), pcl_curr->points.end(),
+                  [max_range_sq](const PointType &point)
+                  {
+                    const double range_sq =
+                        static_cast<double>(point.x) * point.x +
+                        static_cast<double>(point.y) * point.y +
+                        static_cast<double>(point.z) * point.z;
+                    return !std::isfinite(range_sq) ||
+                           range_sq > max_range_sq;
+                  }),
+              pcl_curr->points.end());
+          pcl_curr->width = pcl_curr->points.size();
+          pcl_curr->height = 1;
+          ROS_WARN_THROTTLE(
+              1.0,
+              "Temporary lidar max range filter: %.2f m, kept %lu/%lu points.",
+              lidar_max_range,
+              static_cast<unsigned long>(pcl_curr->size()),
+              static_cast<unsigned long>(original_size));
+        }
 
-        if(pl_down.size() < 500)
+        pcl::PointCloud<PointType> pl_down = *pcl_curr;
+        if(!pl_down.empty())
+          down_sampling_voxel(pl_down, down_size);
+
+        if(pl_down.size() < 500 && !pcl_curr->empty())
         {
           pl_down = *pcl_curr;
           down_sampling_voxel(pl_down, down_size / 2);
@@ -2716,8 +2830,6 @@ public:
               gnss_anchor_ecef.z(), p_gnss->Tex_imu_r.x(),
               p_gnss->Tex_imu_r.y(), p_gnss->Tex_imu_r.z());
         }
-        if(gnss_tdcp_doppler_ieskf_enable && gnss_ready &&
-           !matched_gnss_raw.empty())
         // PVT/LIO matching and loop-frame calibration are intentionally
         // deferred to thd_loop_closure. Absolute factors must not enter the
         // graph before R_enu_local, t_enu_local and the lever arm converge.
@@ -2733,6 +2845,21 @@ public:
           degrade_cnt = 0;
           p_gnss->last_ieskf_degeneracy_aided = false;
         }
+        const bool gnss_aided_degenerate_frame =
+            last_gnss_ieskf_update_valid &&
+            !last_lidar_hessian_well_conditioned;
+        const bool low_lidar_structure_frame =
+            !last_lidar_hessian_well_conditioned;
+        if(gnss_aided_degenerate_frame)
+        {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "GNSS-aided degenerate ESIKF active: lidar matches=%d, "
+              "retained directions=%d/6; "
+              "map insertion and local BA are paused.",
+              last_lidar_match_num,
+              last_lidar_retained_directions);
+        }
 
         pwld.clear();
         pvec_update(pptr, x_curr, pwld);
@@ -2744,6 +2871,7 @@ public:
         win_count++;
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
+        low_lidar_structure_buf.push_back(low_lidar_structure_frame);
         if(win_count > 1)
         {
           imu_pre_buf.push_back(new IMU_PRE(x_buf[win_count-2].bg, x_buf[win_count-2].ba));
@@ -2753,42 +2881,63 @@ public:
         keyframe_loading(jour);
         voxhess.clear(); voxhess.win_size = win_size;
 
-        // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws[0]);
-        cut_voxel_multi(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws);
+        // Do not insert sparse/degenerate scan geometry into the map while
+        // GNSS is carrying the observable position and velocity directions.
+        if(!low_lidar_structure_frame)
+          cut_voxel_multi(surf_map, pvec_buf[win_count-1],
+                          win_count-1, surf_map_slide,
+                          win_size, pwld, sws);
         t2 = ros::Time::now().toSec();
 
-        multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
+        if(!low_lidar_structure_frame)
+          multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
         t3 = ros::Time::now().toSec();
 
         if(degrade_cnt > degrade_bound)
         {
-          degrade_cnt = 0;
-          system_reset(imus);
+          const bool preserve_map_for_gnss_recovery =
+              low_lidar_structure_frame &&
+              GNSS_enable && p_gnss && p_gnss->gnss_ready;
+          if(preserve_map_for_gnss_recovery)
+          {
+            // Keep the initialized map and IMU/GNSS state alive until
+            // geometric structure becomes observable again.
+            degrade_cnt = degrade_bound;
+            ROS_WARN_THROTTLE(
+                1.0,
+                "System reset suppressed during GNSS-aided lidar "
+                "degradation; preserving %lu map voxels for recovery.",
+                static_cast<unsigned long>(surf_map.size()));
+          }
+          else
+          {
+            degrade_cnt = 0;
+            system_reset(imus);
 
-          last_pos = x_curr.p; jour = 0;
+            last_pos = x_curr.p; jour = 0;
 
-          mtx_loop.lock();
-          buf_lba2loop_tem.swap(buf_lba2loop);
-          mtx_loop.unlock();
-          reset_flag = 1;
+            mtx_loop.lock();
+            buf_lba2loop_tem.swap(buf_lba2loop);
+            mtx_loop.unlock();
+            reset_flag = 1;
 
-          motion_init_flag = 1;
-          history_kfsize = 0;
+            motion_init_flag = 1;
+            history_kfsize = 0;
 
-          continue;
+            continue;
+          }
         }
       }
 
       if(win_count >= win_size)
       {
         t4 = ros::Time::now().toSec();
-        // if(GNSS_enable && gnss_ready)
-        // {
-        //   ROS_WARN_THROTTLE(1.0,
-        //     "GNSS aligned and local BA is active: x_curr will be overwritten by optimized x_buf[win_count-1].");
-        // }
-        
-        if(g_update == 2)
+        const bool window_contains_low_lidar_structure =
+            std::find(low_lidar_structure_buf.begin(),
+                      low_lidar_structure_buf.end(), true) !=
+            low_lidar_structure_buf.end();
+
+        if(!window_contains_low_lidar_structure && g_update == 2)
         {
           LI_BA_OptimizerGravity opt_lsv;
           vector<double> resis;
@@ -2797,18 +2946,27 @@ public:
           g_update = 0;
           x_curr.g = x_buf[win_count-1].g;
         }
-        else
+        else if(!window_contains_low_lidar_structure)
         {
           LI_BA_Optimizer opt_lsv;
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
         }
+        else
+        {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "Local BA paused: active window contains low-lidar-structure states.");
+        }
 
-        ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
-        bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-        for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
-        mtx_loop.lock();
-        buf_lba2loop.push_back(bl);
-        mtx_loop.unlock();
+        if(!window_contains_low_lidar_structure)
+        {
+          ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
+          bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
+          for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+          mtx_loop.lock();
+          buf_lba2loop.push_back(bl);
+          mtx_loop.unlock();
+        }
 
         x_curr.R = x_buf[win_count-1].R;
         x_curr.p = x_buf[win_count-1].p;
@@ -2816,12 +2974,21 @@ public:
         x_curr.g = x_buf[win_count-1].g;
         t5 = ros::Time::now().toSec();
 
-        ResultOutput::instance().pub_localmap(mgsize, sessionNames.size()-1, pvec_buf, x_buf, pcl_path, win_base, win_count);
+        if(!window_contains_low_lidar_structure)
+        {
+          ResultOutput::instance().pub_localmap(
+              mgsize, sessionNames.size()-1,
+              pvec_buf, x_buf, pcl_path, win_base, win_count);
+        }
 
+        // Marginalization promotes old sliding-window points into pcr_fix.
+        // Keep doing this while degraded so surf_map remains usable when
+        // LiDAR geometry returns.
         multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
         t6 = ros::Time::now().toSec();
 
-        if((win_base + win_count) % 10 == 0)
+        if(!window_contains_low_lidar_structure &&
+           (win_base + win_count) % 10 == 0)
         {
           double spat = (x_curr.p - last_pos).norm();
           if(spat > 0.5)
@@ -2832,7 +2999,7 @@ public:
           }
         }
 
-        if(is_save_map)
+        if(is_save_map && !window_contains_low_lidar_structure)
         {
           for(int i=0; i<mgsize; i++)
             FileReaderWriter::instance().save_pcd(pvec_buf[i], x_buf[i], win_base + i, savepath + bagname);
@@ -2860,6 +3027,9 @@ public:
           delete imu_pre_buf.front();
           imu_pre_buf.pop_front();
         }
+        for(int i=0;
+            i<mgsize && !low_lidar_structure_buf.empty(); ++i)
+          low_lidar_structure_buf.pop_front();
 
         win_base += mgsize; win_count -= mgsize;
       }

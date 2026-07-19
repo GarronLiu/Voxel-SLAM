@@ -809,14 +809,14 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
     candidates.push_back(candidate);
   }
 
-  // Receiver clock drift is common to all TDCP and Doppler residuals but is
-  // not part of the LIO state. Remove its robust epoch-wise estimate before
-  // per-satellite gating, then marginalize it from the accepted normal system.
+  // Estimate receiver clock drift from Doppler only. TDCP observes
+  // displacement and must not vote in the robust clock-drift median.
   std::vector<double> clock_corrections;
   clock_corrections.reserve(candidates.size());
   for (const ResidualCandidate &candidate : candidates)
   {
-    if (std::fabs(candidate.clock_jacobian) > 1e-8)
+    if (!candidate.is_tdcp &&
+        std::fabs(candidate.clock_jacobian) > 1e-8)
       clock_corrections.push_back(
           -candidate.residual / candidate.clock_jacobian);
   }
@@ -851,16 +851,18 @@ bool GNSSProcess::buildTdcpDopplerIeskfNormal(
     }
 
     const double weight = 1.0 / (candidate.sigma * candidate.sigma);
+    const double clock_jacobian =
+        candidate.is_tdcp ? 0.0 : candidate.clock_jacobian;
     state_hessian += weight *
         candidate.state_jacobian.transpose() * candidate.state_jacobian;
     state_gradient -= weight *
         candidate.state_jacobian.transpose() * corrected_residual;
     state_clock_hessian += weight *
-        candidate.state_jacobian.transpose() * candidate.clock_jacobian;
+        candidate.state_jacobian.transpose() * clock_jacobian;
     clock_hessian += weight *
-        candidate.clock_jacobian * candidate.clock_jacobian;
+        clock_jacobian * clock_jacobian;
     clock_gradient -= weight *
-        candidate.clock_jacobian * corrected_residual;
+        clock_jacobian * corrected_residual;
     if (candidate.is_tdcp)
       ++normal.tdcp_accepted;
     else

@@ -6,6 +6,7 @@ General:
   bagname: "mid360_init"
   lidar_type: 0
   blind: 0.5 # 0.5
+  lidar_max_range: 25.0
   point_filter_num: 3
   extrinsic_tran: [-0.011, -0.02329, 0.04412]
   extrinsic_rota: [1, 0, 0,
@@ -27,6 +28,9 @@ Odometry:
   voxel_size: 1
   min_eigen_value: 0.0025
   degrade_bound: 10
+  min_lidar_match_num: 50
+  lidar_max_condition_number: 10000.0
+  lidar_min_normalized_eigenvalue: 0.0001
   point_notime: 0
 
 LocalBA:
@@ -42,7 +46,7 @@ LocalBA:
   thread_num: 5
 
 GNSS:
-  GNSS_enable: 0
+  GNSS_enable: 1
   gnss_ephem_topic: "/ublox_driver/ephem"
   gnss_glo_ephem_topic: "/ublox_driver/glo_ephem"
   gnss_meas_topic: "/ublox_driver/range_meas"
@@ -59,10 +63,9 @@ GNSS:
   dopp_std_thres: 2.0
   gnss_cp_std_thres: 1.0
   gnss_cp_time_thres: 100.0
-  gnss_sample_period: 10.0
-  tight_coupling_enable: true
+  gnss_sample_period: 0.1
   tdcp_doppler_ieskf_enable: true
-  pvt_loop_enable: true
+  pvt_loop_enable: false
   pvt_loop_min_distance: 10.0
   pvt_loop_time_tolerance: 0.2
   pvt_loop_trigger_count: 5

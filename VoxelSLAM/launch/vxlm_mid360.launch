@@ -9,7 +9,7 @@
 	</group>
 	<group if="$(arg debug)">
 		<node pkg="voxel_slam" type="voxelslam" name="voxelslam" output="screen"
-			launch-prefix="xterm -hold -e gdb -q -ex run -ex &quot;thread apply all bt full&quot; --args"/>
+			launch-prefix="xterm -e gdb -ex run --args"/>
 	</group>
   
 	<group if="$(arg rviz)">
