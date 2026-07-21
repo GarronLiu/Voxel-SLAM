@@ -2665,6 +2665,12 @@ public:
     vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;
     bool release_flag = false;
     int degrade_cnt = 0;
+    int consecutive_lidar_degenerate_frames = 0;
+    int frames_since_valid_gnss_ieskf = 16;
+    constexpr int kRecoveryDegenerateFrames = 10;
+    constexpr int kRecoveryInsertionInterval = 5;
+    constexpr int kRecoveryMinimumDownsampledPoints = 100;
+    constexpr int kRecoveryGnssMaximumAgeFrames = 15;
     LidarFactor voxhess(win_size);
     const int mgsize = 1;
     Eigen::MatrixXd hess;
@@ -2790,6 +2796,9 @@ public:
         {
           motion_init_flag = 0;
           low_lidar_structure_buf.assign(win_count, false);
+          consecutive_lidar_degenerate_frames = 0;
+          frames_since_valid_gnss_ieskf =
+              kRecoveryGnssMaximumAgeFrames + 1;
         }
         else
         {
@@ -2903,13 +2912,36 @@ public:
             !last_lidar_hessian_well_conditioned;
         const bool low_lidar_structure_frame =
             !last_lidar_hessian_well_conditioned;
+        if(low_lidar_structure_frame)
+          ++consecutive_lidar_degenerate_frames;
+        else
+          consecutive_lidar_degenerate_frames = 0;
+
+        if(last_gnss_ieskf_update_valid)
+          frames_since_valid_gnss_ieskf = 0;
+        else if(frames_since_valid_gnss_ieskf <=
+                kRecoveryGnssMaximumAgeFrames)
+          ++frames_since_valid_gnss_ieskf;
+
+        const bool recovery_insertion_frame =
+            low_lidar_structure_frame &&
+            consecutive_lidar_degenerate_frames >=
+                kRecoveryDegenerateFrames &&
+            (consecutive_lidar_degenerate_frames -
+             kRecoveryDegenerateFrames) %
+                    kRecoveryInsertionInterval ==
+                0 &&
+            pl_down.size() >= kRecoveryMinimumDownsampledPoints &&
+            p_gnss && p_gnss->gnss_ready &&
+            frames_since_valid_gnss_ieskf <=
+                kRecoveryGnssMaximumAgeFrames;
         if(gnss_aided_degenerate_frame)
         {
           ROS_WARN_THROTTLE(
               1.0,
               "GNSS-aided degenerate ESIKF active: lidar matches=%d, "
               "retained directions=%d/6; "
-              "map insertion and local BA are paused.",
+              "regular map insertion and local BA are paused.",
               last_lidar_match_num,
               last_lidar_retained_directions);
         }
@@ -2934,16 +2966,28 @@ public:
         keyframe_loading(jour);
         voxhess.clear(); voxhess.win_size = win_size;
 
-        // Do not insert sparse/degenerate scan geometry into the map while
-        // GNSS is carrying the observable position and velocity directions.
-        if(!low_lidar_structure_frame)
+        // Periodic GNSS-supported seed scans let the map reacquire geometry
+        // without treating the degraded window as valid for local BA.
+        const bool allow_surf_map_insertion =
+            !low_lidar_structure_frame || recovery_insertion_frame;
+        if(allow_surf_map_insertion)
           cut_voxel_multi(surf_map, pvec_buf[win_count-1],
                           win_count-1, surf_map_slide,
                           win_size, pwld, sws);
         t2 = ros::Time::now().toSec();
 
-        if(!low_lidar_structure_frame)
+        if(allow_surf_map_insertion)
           multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
+        if(recovery_insertion_frame)
+        {
+          ROS_WARN(
+              "GNSS-assisted map recovery scan inserted: degraded=%d "
+              "points=%lu gnss_age=%d map_voxels=%lu.",
+              consecutive_lidar_degenerate_frames,
+              static_cast<unsigned long>(pl_down.size()),
+              frames_since_valid_gnss_ieskf,
+              static_cast<unsigned long>(surf_map.size()));
+        }
         t3 = ros::Time::now().toSec();
 
         if(degrade_cnt > degrade_bound)
@@ -2976,6 +3020,9 @@ public:
 
             motion_init_flag = 1;
             history_kfsize = 0;
+            consecutive_lidar_degenerate_frames = 0;
+            frames_since_valid_gnss_ieskf =
+                kRecoveryGnssMaximumAgeFrames + 1;
 
             continue;
           }
