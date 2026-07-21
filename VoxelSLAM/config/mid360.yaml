@@ -75,9 +75,6 @@ GNSS:
   pvt_covariance_scale: 400.0
   pvt_min_num_sv: 12
   tc_max_correction: 30.0
-  lio_sqrt_info_min: 0.1
-  lio_sqrt_info_max: 30.0
-  lio_sqrt_info_scale: 0.0001
   window_size: 30
   elevation_thres: 30.0  
   min_obs: 5

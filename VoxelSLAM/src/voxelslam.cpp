@@ -792,10 +792,6 @@ public:
   uint32_t gnss_track_num_thres = 20;
   int gnss_min_obs = 10;
   double gnss_min_hor_vel = 0.3;
-  double gnss_tc_max_correction = 30.0;
-  double gnss_lio_sqrt_info_min = 0.1;
-  double gnss_lio_sqrt_info_max = 30.0;
-  double gnss_lio_sqrt_info_scale = 1.0;
   bool gnss_tdcp_doppler_ieskf_enable = false;
   bool last_lidar_hessian_well_conditioned = false;
   bool last_gnss_ieskf_update_valid = false;
@@ -1067,10 +1063,6 @@ public:
         gnss_pvt_recovery_time = max(0.0, gnss_pvt_recovery_time);
         gnss_pvt_covariance_scale = max(1.0, gnss_pvt_covariance_scale);
         gnss_pvt_min_num_sv = max(4, gnss_pvt_min_num_sv);
-        n.param<double>("GNSS/tc_max_correction", gnss_tc_max_correction, 30.0);
-        n.param<double>("GNSS/lio_sqrt_info_min", gnss_lio_sqrt_info_min, 0.1);
-        n.param<double>("GNSS/lio_sqrt_info_max", gnss_lio_sqrt_info_max, 30.0);
-        n.param<double>("GNSS/lio_sqrt_info_scale", gnss_lio_sqrt_info_scale, 1.0);
 
         n.param<double>("GNSS/psr_std_thres", gnss_psr_std_thres, 2.0);
         n.param<double>("GNSS/dopp_std_thres", gnss_dopp_std_thres, 2.0);
@@ -2476,40 +2468,6 @@ public:
     win_base = 0; win_count = 0; pcl_path.clear();
     pub_pl_func(pcl_path, pub_cmap);
     ROS_WARN("Reset");
-  }
-
-  double lio_sqrt_info_from_hessian_diag(double hessian_diag) const
-  {
-    double info = std::fabs(hessian_diag);
-    if(!std::isfinite(info) || info < 1e-12)
-      info = gnss_lio_sqrt_info_min * gnss_lio_sqrt_info_min;
-    double sqrt_info = std::sqrt(info) * gnss_lio_sqrt_info_scale;
-    return std::min(std::max(sqrt_info, gnss_lio_sqrt_info_min), gnss_lio_sqrt_info_max);
-  }
-
-  Eigen::Matrix<double, 24, 24> gnss_lio_sqrt_from_ba_hessian(const Eigen::MatrixXd &ba_hess,
-                                                              int state_index) const
-  {
-    Eigen::Matrix<double, 24, 24> sqrt_info = Eigen::Matrix<double, 24, 24>::Identity();
-    sqrt_info *= gnss_lio_sqrt_info_min;
-
-    const int base = state_index * DIM;
-    if(state_index < 0 || ba_hess.rows() < base + DIM || ba_hess.cols() < base + DIM)
-      return sqrt_info;
-
-    auto set_diag3 = [&](int residual_offset, int state_offset)
-    {
-      for(int k = 0; k < 3; ++k)
-        sqrt_info(residual_offset + k, residual_offset + k) =
-            lio_sqrt_info_from_hessian_diag(ba_hess(base + state_offset + k, base + state_offset + k));
-    };
-
-    set_diag3(0, 3);   // position
-    set_diag3(3, 0);   // rotation
-    set_diag3(6, 6);   // velocity
-    set_diag3(18, 9);  // gyro bias
-    set_diag3(21, 12); // accel bias
-    return sqrt_info;
   }
 
   // After local BA, update the map and marginalize the points of oldest scan
