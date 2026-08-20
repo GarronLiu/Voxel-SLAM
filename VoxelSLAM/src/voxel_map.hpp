@@ -119,8 +119,34 @@ public:
 
   LidarFactor(int _w): win_size(_w){}
 
-  void push_voxel(vector<PointCluster> &vec_orig, PointCluster &fix, double coe, Eigen::Vector3d &eig_value, Eigen::Matrix3d &eig_vector, PointCluster &pcr_add)
+  bool valid() const
   {
+    const size_t count = plvec_voxels.size();
+    if(sig_vecs.size() != count || coeffs.size() != count ||
+       eig_values.size() != count || eig_vectors.size() != count ||
+       pcr_adds.size() != count)
+      return false;
+
+    for(const vector<PointCluster> &factor : plvec_voxels)
+      if(factor.size() != static_cast<size_t>(win_size))
+        return false;
+    return true;
+  }
+
+  void push_voxel(const vector<PointCluster> &vec_orig,
+                  const PointCluster &fix, double coe,
+                  const Eigen::Vector3d &eig_value,
+                  const Eigen::Matrix3d &eig_vector,
+                  const PointCluster &pcr_add)
+  {
+    if(vec_orig.size() != static_cast<size_t>(win_size))
+    {
+      ROS_ERROR_THROTTLE(
+          1.0,
+          "Reject malformed LiDAR factor: factor_size=%zu win_size=%d.",
+          vec_orig.size(), win_size);
+      return;
+    }
     plvec_voxels.push_back(vec_orig);
     sig_vecs.push_back(fix);
     coeffs.push_back(coe);
@@ -132,6 +158,15 @@ public:
   void acc_evaluate2(const vector<IMUST> &xs, int head, int end, Eigen::MatrixXd &Hess, Eigen::VectorXd &JacT, double &residual)
   {
     Hess.setZero(); JacT.setZero(); residual = 0;
+    if(!valid() || xs.size() < static_cast<size_t>(win_size) ||
+       head < 0 || end < head ||
+       end > static_cast<int>(plvec_voxels.size()))
+    {
+      ROS_ERROR_THROTTLE(1.0,
+          "Skip malformed LiDAR factor evaluation: factors=%zu win_size=%d xs=%zu range=[%d,%d).",
+          plvec_voxels.size(), win_size, xs.size(), head, end);
+      return;
+    }
     vector<PointCluster> sig_tran(win_size);
     const int kk = 0;
 
@@ -163,6 +198,8 @@ public:
       Eigen::Vector3d lmbd = eig_values[a];
       Eigen::Matrix3d U = eig_vectors[a];
       int NN = pcr_adds[a].N;
+      if(NN <= 0)
+        continue;
       Eigen::Vector3d vBar = pcr_adds[a].v / NN;
       
       Eigen::Vector3d u[3] = {U.col(0), U.col(1), U.col(2)};
@@ -243,6 +280,15 @@ public:
   void evaluate_only_residual(const vector<IMUST> &xs, int head, int end, double &residual)
   {
     residual = 0;
+    if(!valid() || xs.size() < static_cast<size_t>(win_size) ||
+       head < 0 || end < head ||
+       end > static_cast<int>(plvec_voxels.size()))
+    {
+      ROS_ERROR_THROTTLE(1.0,
+          "Skip malformed LiDAR residual evaluation: factors=%zu win_size=%d xs=%zu range=[%d,%d).",
+          plvec_voxels.size(), win_size, xs.size(), head, end);
+      return;
+    }
     // vector<PointCluster> sig_tran(win_size);
     int kk = 0; // The kk-th lambda value
 
@@ -261,6 +307,8 @@ public:
         sig += pcr;
       }
 
+      if(sig.N <= 0)
+        continue;
       Eigen::Vector3d vBar = sig.v / sig.N;
       // Eigen::Matrix3d cmt = sig.P/sig.N - vBar * vBar.transpose();
       // Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(sig.P - sig.v * vBar.transpose());
@@ -340,18 +388,20 @@ public:
     // voxhess.evaluate_only_residual(x_stats, 0, voxhess.plvec_voxels.size(), residual1);
 
     // int thd_num = 2;
-    vector<double> residuals(thd_num, 0);
     int g_size = voxhess.plvec_voxels.size();
-    if(g_size < thd_num)
+    if(g_size <= 0)
     {
-      printf("Too Less Voxel"); exit(0);
+      ROS_WARN_THROTTLE(1.0, "Skip LiDAR residual: no valid voxel factors.");
+      return std::numeric_limits<double>::infinity();
     }
-    vector<thread*> mthreads(thd_num, nullptr);
-    double part = 1.0 * g_size / thd_num;
-    for(int i=1; i<thd_num; i++)
+    const int active_threads = std::max(1, std::min(thd_num, g_size));
+    vector<double> residuals(active_threads, 0);
+    vector<thread*> mthreads(active_threads, nullptr);
+    double part = 1.0 * g_size / active_threads;
+    for(int i=1; i<active_threads; i++)
       mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
 
-    for(int i=0; i<thd_num; i++)
+    for(int i=0; i<active_threads; i++)
     {
       if(i != 0) 
         mthreads[i]->join();
@@ -1137,6 +1187,8 @@ struct Keyframe
   pcl::PointCloud<PointType>::Ptr plptr;
   int exist;
   int id, mp;
+  // HBA windows must not span a geometrically degraded lidar interval.
+  int hba_segment = 0;
   float jour;
 
   Keyframe(IMUST &_x0): x0(_x0), exist(0)
@@ -1176,10 +1228,15 @@ public:
 
   void resize(int wdsize)
   {
-    if(points.size() != wdsize)
+    if(points.size() != static_cast<size_t>(wdsize) ||
+       pcrs_local.size() != static_cast<size_t>(wdsize))
     {
+      points.clear();
+      pcrs_local.clear();
       points.resize(wdsize);
       pcrs_local.resize(wdsize);
+      for(int i=0; i<wdsize; i++)
+        points[i].reserve(20);
     }
   }
 
@@ -1232,9 +1289,29 @@ public:
     // ins = 255.0*rand()/(RAND_MAX + 1.0f);
   }
 
+  bool valid_slot(int ord) const
+  {
+    if(sw == nullptr || mp == nullptr || ord < 0 || ord >= wdsize)
+      return false;
+    const int slot = mp[ord];
+    return slot >= 0 &&
+           slot < static_cast<int>(sw->points.size()) &&
+           slot < static_cast<int>(sw->pcrs_local.size());
+  }
+
+  bool valid_slots(int count) const
+  {
+    if(count < 0 || count > wdsize)
+      return false;
+    for(int i=0; i<count; ++i)
+      if(!valid_slot(i))
+        return false;
+    return true;
+  }
+
   inline void push(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
   {
-    mVox.lock();
+    lock_guard<mutex> lock(mVox);
     if(sw == nullptr)
     {
       if(sws.size() != 0)
@@ -1246,9 +1323,19 @@ public:
       else
         sw = new SlideWindow(wdsize);
     }
-    if(!isexist) isexist = true;
 
-    int mord = mp[ord];
+    if(!valid_slot(ord))
+    {
+      ROS_ERROR_THROTTLE(1.0,
+          "Reject invalid OctoTree slot: ord=%d wdsize=%d mp=%p points=%zu pcrs=%zu.",
+          ord, wdsize, static_cast<void*>(mp),
+          sw ? sw->points.size() : 0,
+          sw ? sw->pcrs_local.size() : 0);
+      return;
+    }
+
+    if(!isexist) isexist = true;
+    const int mord = mp[ord];
     if(layer < max_layer)
       sw->points[mord].push_back(pv);
     sw->pcrs_local[mord].push(pv.pnt);
@@ -1256,7 +1343,6 @@ public:
     Eigen::Matrix<double, 9, 9> Bi;
     Bf_var(pv, Bi, pw);
     cov_add += Bi;
-    mVox.unlock();
   }
 
   inline void push_fix(pointVar &pv)
@@ -1361,6 +1447,13 @@ public:
 
   void subdivide(int si, IMUST &xx, vector<SlideWindow*> &sws)
   {
+    if(!valid_slot(si))
+    {
+      ROS_ERROR_THROTTLE(1.0,
+          "Skip OctoTree subdivision with invalid slot: scan=%d wdsize=%d.",
+          si, wdsize);
+      return;
+    }
     for(pointVar &pv: sw->points[mp[si]])
     {
       Eigen::Vector3d pw = xx.R * pv.pnt + xx.p;
@@ -1423,6 +1516,14 @@ public:
           plane.is_plane = false; return;
         }
         if(!isexist || sw == nullptr) return;
+        if(x_buf.size() < static_cast<size_t>(win_count) ||
+           !valid_slots(win_count))
+        {
+          ROS_ERROR_THROTTLE(1.0,
+              "Skip OctoTree recut with inconsistent sliding window: win_count=%d wdsize=%d xs=%zu.",
+              win_count, wdsize, x_buf.size());
+          return;
+        }
 
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(pcr_add.cov());
         eig_value  = saes.eigenvalues();
@@ -1464,7 +1565,16 @@ public:
     if(octo_state == 0 && layer>=0)
     {
       if(!isexist || sw == nullptr) return;
-      mVox.lock();
+      lock_guard<mutex> lock(mVox);
+      if(x_buf.size() < static_cast<size_t>(win_count) ||
+         mgsize < 0 || mgsize > win_count ||
+         !valid_slots(win_count))
+      {
+        ROS_ERROR_THROTTLE(1.0,
+            "Skip OctoTree marginalization with inconsistent sliding window: win_count=%d mgsize=%d wdsize=%d xs=%zu.",
+            win_count, mgsize, wdsize, x_buf.size());
+        return;
+      }
       vector<PointCluster> pcrs_world(wdsize);
       // pcr_add = pcr_fix;
       // for(int i=0; i<win_count; i++)
@@ -1476,8 +1586,11 @@ public:
 
       if(opt_state >= int(vox_opt.pcr_adds.size()))
       {
-        printf("Error: opt_state: %d %zu\n", opt_state, vox_opt.pcr_adds.size());
-        exit(0);
+        ROS_ERROR_THROTTLE(1.0,
+            "Skip OctoTree marginalization with stale factor index: opt_state=%d factors=%zu.",
+            opt_state, vox_opt.pcr_adds.size());
+        opt_state = -1;
+        return;
       }
 
       if(opt_state >= 0)
@@ -1555,7 +1668,6 @@ public:
       else
         isexist = true;
       
-      mVox.unlock();
     }
     else
     {
@@ -1578,6 +1690,13 @@ public:
       if(layer >= 0 && isexist && plane.is_plane && sw!=nullptr)
       {
         if(eig_value[0]/eig_value[1] > 0.12) return;
+        if(!valid_slots(wdsize))
+        {
+          ROS_ERROR_THROTTLE(1.0,
+              "Skip LiDAR factor extraction with inconsistent slots: wdsize=%d.",
+              wdsize);
+          return;
+        }
 
         double coe = 1;
         vector<PointCluster> pcrs(wdsize);
@@ -1788,7 +1907,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
     {
       iter->second->allocate(win_count, pv, pw, sws);
       iter->second->isexist = true;
-      if(feat_tem_map.find(position) == feat_map.end())
+      if(feat_tem_map.find(position) == feat_tem_map.end())
         feat_tem_map[position] = iter->second;
     }
     else
@@ -1829,7 +1948,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
     if(iter != feat_map.end())
     {
       iter->second->isexist = true;
-      if(feat_tem_map.find(position) == feat_map.end())
+      if(feat_tem_map.find(position) == feat_tem_map.end())
         feat_tem_map[position] = iter->second;
       ot = iter->second;
     }
@@ -1859,9 +1978,20 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
   for(auto iter=map_pvec.begin(); iter!=map_pvec.end(); iter++)
     octs.push_back(&(*iter));
 
-  int thd_num = sws.size();
   int g_size = octs.size();
-  if(g_size < thd_num) return;
+  if(g_size == 0)
+    return;
+  if(sws.empty())
+  {
+    ROS_ERROR_THROTTLE(
+        1.0, "Skip voxel insertion: SlideWindow pool list is empty.");
+    return;
+  }
+  // Sparse maps must still receive their points.  The previous early return
+  // happened after new OctoTree roots had been inserted into feat_map, leaving
+  // those roots empty whenever voxel count was smaller than thread count.
+  const int thd_num = std::min(
+      g_size, static_cast<int>(sws.size()));
   vector<thread*> mthreads(thd_num);
   double part = 1.0 * g_size / thd_num;
 

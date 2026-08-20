@@ -23,6 +23,7 @@
 #include <tf/transform_broadcaster.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <malloc.h>
+#include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseArray.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <nav_msgs/Odometry.h>
@@ -48,6 +49,7 @@ using namespace std;
 ros::Publisher pub_scan, pub_cmap, pub_init, pub_pmap;
 ros::Publisher pub_test, pub_prev_path, pub_curr_path;
 ros::Publisher pub_gnss_fix_local, pub_gnss_pvt_local, pub_gnss_spp_local, pub_gnss_tc_local;
+ros::Publisher pub_gnss_pvt_factor;
 ros::Publisher pub_lio_odom_enu;
 ros::Subscriber sub_imu, sub_pcl;
 ros::Subscriber sub_gnss_ephem, sub_gnss_glo_ephem, sub_gnss_meas, sub_gnss_iono_params;
@@ -67,6 +69,7 @@ void pub_pl_func(T &pl, ros::Publisher &pub)
 mutex mBuf;
 mutex mPvtBuf;
 mutex mGnssMeasBuf;
+mutex mGnssRawHealth;
 Features feat;
 deque<sensor_msgs::Imu::Ptr> imu_buf;
 deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
@@ -74,6 +77,13 @@ deque<double> time_buf;
 deque<gnss_comm::PVTSolutionPtr> gnss_pvt_buf;
 deque<vector<gnss_comm::ObsPtr>> gnss_meas_sync_buf;
 queue<vector<gnss_comm::ObsPtr>> gnss_meas_buf;
+
+struct RawGnssHealthEpoch
+{
+  double timestamp = -1.0;
+  int observations = 0;
+};
+deque<RawGnssHealthEpoch> gnss_raw_health_epochs;
 
 std::shared_ptr<GNSSProcess> p_gnss;
 
@@ -124,7 +134,18 @@ void gnss_meas_handler(const gnss_comm::GnssMeasMsgConstPtr &msg_in)
   vector<gnss_comm::ObsPtr> gnss_meas = gnss_comm::msg2meas(msg_in);
   if(gnss_meas.empty())
     return;
-  //latest_gnss_time = time2sec(gnss_meas[0]->time);
+  const double raw_timestamp =
+      gnss_comm::time2sec(gnss_meas.front()->time);
+  if(std::isfinite(raw_timestamp))
+  {
+    lock_guard<mutex> health_lock(mGnssRawHealth);
+    RawGnssHealthEpoch health;
+    health.timestamp = raw_timestamp;
+    health.observations = static_cast<int>(gnss_meas.size());
+    gnss_raw_health_epochs.push_back(health);
+    while(gnss_raw_health_epochs.size() > 200)
+      gnss_raw_health_epochs.pop_front();
+  }
 
   {
     lock_guard<mutex> lock(mGnssMeasBuf);
@@ -475,6 +496,27 @@ void read_lidarstate(string filename, vector<ScanPose*> &bl_tem)
     if(nums.size() >= 26)
       for(int i=0; i<6; i++) 
         blp->v6[i] = nums[i + 20];
+    blp->frame_id = static_cast<int>(bl_tem.size()) - 1;
+    if(nums.size() >= 28)
+    {
+      blp->frame_id = static_cast<int>(std::llround(nums[26]));
+      blp->hba_eligible = nums[27] != 0.0;
+    }
+    else if(nums.size() >= 27)
+    {
+      // Compatibility with the previous 27-column format whose last field
+      // was either hba_eligible or the short-lived frame_id field.
+      if(nums[26] < 0.0 || nums[26] > 1.0)
+        blp->frame_id = static_cast<int>(std::llround(nums[26]));
+      else
+        blp->hba_eligible = nums[26] != 0.0;
+    }
+    if(nums.size() >= 35)
+    {
+      blp->odom_x.p << nums[28], nums[29], nums[30];
+      blp->odom_x.R = Eigen::Quaterniond(
+          nums[34], nums[31], nums[32], nums[33]).matrix();
+    }
   }
 }
 

@@ -9,7 +9,7 @@
 	</group>
 	<group if="$(arg debug)">
 		<node pkg="voxel_slam" type="voxelslam" name="voxelslam" output="screen"
-			launch-prefix="xterm -e gdb -ex run --args"/>
+			launch-prefix="/bin/bash $(find voxel_slam)/scripts/run_gdb_batch.sh"/>
 	</group>
   
 	<group if="$(arg rviz)">

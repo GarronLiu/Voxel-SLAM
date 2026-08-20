@@ -37,7 +37,7 @@ public:
     for(Eigen::Vector3d &pw: pwld)
     {
       Eigen::Vector3d pvec = pw;
-      PointType ap;
+      PointType ap{};
       ap.x = pvec.x();
       ap.y = pvec.y();
       ap.z = pvec.z();
@@ -47,7 +47,7 @@ public:
     
     Eigen::Vector3d pcurr = x_curr.p;
 
-    PointType ap;
+    PointType ap{};
     ap.x = pcurr[0];
     ap.y = pcurr[1];
     ap.z = pcurr[2];
@@ -59,6 +59,19 @@ public:
 
   void pub_localmap(int mgsize, int cur_session, vector<PVecPtr> &pvec_buf, vector<IMUST> &x_buf, pcl::PointCloud<PointType> &pcl_path, int win_base, int win_count)
   {
+    if(mgsize < 0 || win_base < 0 || win_count < 0 ||
+       static_cast<size_t>(mgsize) > pvec_buf.size() ||
+       static_cast<size_t>(mgsize) > x_buf.size() ||
+       static_cast<size_t>(win_count) > x_buf.size())
+    {
+      ROS_ERROR_THROTTLE(
+          1.0,
+          "Skip local-map publication: invalid path/window layout "
+          "mgsize=%d win_base=%d win_count=%d pvec=%zu x_buf=%zu",
+          mgsize, win_base, win_count, pvec_buf.size(), x_buf.size());
+      return;
+    }
+
     pcl::PointCloud<PointType> pcl_send;
     for(int i=0; i<mgsize; i++)
     {
@@ -66,7 +79,7 @@ public:
       {
         pointVar &pv = pvec_buf[i]->at(j);
         Eigen::Vector3d pvec = x_buf[i].R*pv.pnt + x_buf[i].p;
-        PointType ap;
+        PointType ap{};
         ap.x = pvec[0];
         ap.y = pvec[1];
         ap.z = pvec[2];
@@ -75,12 +88,28 @@ public:
       }
     }
 
+    const size_t required_path_size =
+        static_cast<size_t>(win_base) + static_cast<size_t>(win_count);
+    if(pcl_path.size() < required_path_size)
+    {
+      ROS_ERROR_THROTTLE(
+          1.0,
+          "Skip trajectory update after map correction: path=%zu required=%zu "
+          "(base=%d count=%d)",
+          pcl_path.size(), required_path_size, win_base, win_count);
+      pub_pl_func(pcl_send, pub_cmap);
+      return;
+    }
+
     for(int i=0; i<win_count; i++)
     {
       Eigen::Vector3d pcurr = x_buf[i].p;
-      pcl_path[i+win_base].x = pcurr[0];
-      pcl_path[i+win_base].y = pcurr[1];
-      pcl_path[i+win_base].z = pcurr[2];
+      PointType &path_point = pcl_path.points[
+          static_cast<size_t>(win_base) + static_cast<size_t>(i)];
+      path_point.x = pcurr[0];
+      path_point.y = pcurr[1];
+      path_point.z = pcurr[2];
+      path_point.intensity = cur_session;
     }
 
     pub_pl_func(pcl_path, pub_curr_path);
@@ -191,6 +220,14 @@ public:
       posfile << " " << xx.ba[0] << " " << xx.ba[1] << " " << xx.ba[2];
       posfile << " " << xx.g[0] << " " << xx.g[1] << " " << xx.g[2];
       for(int j=0; j<6; j++) posfile << " " << bbuf[i]->v6[j];
+      posfile << " " << bbuf[i]->frame_id;
+      posfile << " " << (bbuf[i]->hba_eligible ? 1 : 0);
+      const IMUST &odom_x = bbuf[i]->odom_x;
+      const Eigen::Quaterniond odom_q(odom_x.R);
+      posfile << " " << odom_x.p.x() << " " << odom_x.p.y()
+              << " " << odom_x.p.z();
+      posfile << " " << odom_q.x() << " " << odom_q.y()
+              << " " << odom_q.z() << " " << odom_q.w();
       posfile << endl;
     }
     posfile.close();
@@ -327,13 +364,46 @@ public:
       deque<IMUST> xxbuf;
       pcl::PointCloud<PointType> pl_lc;
       pcl::PointCloud<pcl::PointXYZI>::Ptr pl_btc(new pcl::PointCloud<pcl::PointXYZI>());
+      int hba_segment = 0;
+      bool hba_gap_open = false;
 
       for(int i=0; i<bl_tem->size() && n.ok(); i++)
       {
-        IMUST &xc = bl_tem->at(i)->x;
-        string pcdname = fname + "/" + to_string(i) + ".pcd";
+        ScanPose &scan_pose = *bl_tem->at(i);
+        if(!scan_pose.hba_eligible)
+        {
+          if(!hba_gap_open)
+          {
+            ++hba_segment;
+            hba_gap_open = true;
+          }
+          // Never aggregate a keyframe across a degraded interval.
+          plbuf.clear();
+          xxbuf.clear();
+          continue;
+        }
+        hba_gap_open = false;
+
+        IMUST &xc = scan_pose.x;
+        const int frame_id = scan_pose.frame_id >= 0 ?
+            scan_pose.frame_id : i;
+        string pcdname = fname + "/" + to_string(frame_id) + ".pcd";
         pcl::PointCloud<pcl::PointXYZI>::Ptr pl_tem(new pcl::PointCloud<pcl::PointXYZI>());
-        pcl::io::loadPCDFile(pcdname, *pl_tem);
+        const int load_result = pcl::io::loadPCDFile(pcdname, *pl_tem);
+        if(load_result < 0 || pl_tem->empty())
+        {
+          if(!hba_gap_open)
+          {
+            ++hba_segment;
+            hba_gap_open = true;
+          }
+          ROS_WARN(
+              "Skip historical HBA pose %d (frame=%d): PCD missing/empty: %s",
+              i, frame_id, pcdname.c_str());
+          plbuf.clear();
+          xxbuf.clear();
+          continue;
+        }
 
         xxbuf.push_back(xc);
         plbuf.push_back(pl_tem);
@@ -344,6 +414,7 @@ public:
         pl_lc.clear();
         Keyframe *smp = new Keyframe(xc);
         smp->id = i;
+        smp->hba_segment = hba_segment;
         PointType pt;
         for(int j=0; j<win_size; j++)
         {
@@ -360,6 +431,13 @@ public:
         }
 
         down_sampling_voxel(pl_lc, voxel_size/10);
+        if(pl_lc.empty())
+        {
+          delete smp;
+          plbuf.clear();
+          xxbuf.clear();
+          continue;
+        }
         smp->plptr->reserve(pl_lc.size());
         for(PointType &pp: pl_lc.points)
           smp->plptr->push_back(pp);
@@ -738,28 +816,33 @@ public:
   vector<ScanPose*> *scanPoses;
   //vector<ScanPose*> rtkPoses; //添加绝对位置校正
   mutex mtx_loop;
+  mutex mtx_history_map;
+  mutex mtx_map_handoff;
   deque<ScanPose*> buf_lba2loop, buf_lba2loop_tem;
   vector<Keyframe*> *keyframes;
   std::atomic<int> loop_detect{0};
   unordered_map<VOXEL_LOC, OctoTree*> map_loop;
   IMUST dx;
+  IMUST pending_map_dx;
   pcl::PointCloud<PointType>::Ptr pl_kdmap;
   pcl::KdTreeFLANN<PointType> kd_keyframes;
   int history_kfsize = 0;
   vector<OctoTree*> octos_release;
-  int reset_flag = 0;
+  std::atomic<int> reset_flag{0};
+  std::atomic<bool> pvt_backend_reset_requested{false};
   int g_update = 0;
+  std::atomic<bool> rotate_gravity_on_map_update{false};
   int thread_num = 5;
   int degrade_bound = 10;
 
   vector<vector<ScanPose*>*> multimap_scanPoses;
   vector<vector<Keyframe*>*> multimap_keyframes;
-  volatile int gba_flag = 0;
+  std::atomic<int> gba_flag{0};
   int gba_size = 0;
   vector<int> cnct_map;
   mutex mtx_keyframe;
   mutex mtx_pvt_loop;
-  PGO_Edges gba_edges1, gba_edges2;
+  PGO_Edges gba_edges1, gba_edges2, committed_hba_edges;
   bool is_finish = false;
 
   vector<string> sessionNames;
@@ -778,10 +861,14 @@ public:
   double gnss_pvt_min_velocity_std = 0.05;
   double gnss_pvt_iekf_converge_pos = 1e-3;
   double gnss_pvt_iekf_converge_vel = 1e-3;
-  double gnss_pvt_recovery_time = 10.0;
   double gnss_pvt_covariance_scale = 100.0;
   int gnss_pvt_min_num_sv = 6;
-  double gnss_pvt_good_since = -1.0;
+  bool gnss_pvt_require_raw_observations = true;
+  double gnss_pvt_raw_time_tolerance = 0.2;
+  int gnss_pvt_raw_recovery_count = 5;
+  int gnss_pvt_raw_consecutive_healthy = 0;
+  double gnss_pvt_raw_last_counted_timestamp =
+      -std::numeric_limits<double>::infinity();
   double gnss_pvt_last_timestamp = -1.0;
   bool gnss_pvt_quality_was_good = false;
 
@@ -798,6 +885,44 @@ public:
   int last_lidar_match_num = 0;
   int last_lidar_retained_directions = 0;
   bool gnss_pvt_loop_enable = true;
+  bool gnss_pvt_hba_enable = true;
+  bool gnss_pgo_include_degenerate_poses = true;
+  double gnss_degenerate_odom_rotation_std = 0.0872664626;
+  double gnss_degenerate_odom_translation_std = 2.0;
+  int gnss_pvt_hba_min_keyframes = 20;
+  double gnss_pvt_hba_min_interval = 60.0;
+  double last_gnss_pvt_hba_time = -std::numeric_limits<double>::infinity();
+  double gnss_pvt_loop_max_innovation = 5.0;
+  double gnss_pvt_loop_max_mahalanobis = 6.0;
+  int gnss_pvt_loop_quarantine_reject_count = 2;
+  int gnss_pvt_loop_recovery_accept_count = 5;
+  double gnss_pvt_loop_rollback_seconds = 30.0;
+  bool gnss_pvt_pearson_enable = true;
+  int gnss_pvt_pearson_window_size = 30;
+  int gnss_pvt_pearson_min_samples = 15;
+  double gnss_pvt_pearson_threshold = 0.90;
+  double gnss_pvt_pearson_min_baseline = 5.0;
+  double gnss_pvt_increment_rmse_threshold = 0.50;
+  double gnss_pvt_increment_max_error = 1.50;
+  int gnss_pvt_pearson_recovery_count = 3;
+  int gnss_pvt_pearson_reject_count = 2;
+  double gnss_pvt_pearson_degenerate_hold_time = 10.0;
+  bool pvt_pearson_available = false;
+  bool pvt_pearson_latest_accepted = false;
+  int pvt_pearson_consecutive_accepts = 0;
+  int pvt_pearson_consecutive_rejects = 0;
+  double pvt_pearson_score =
+      -std::numeric_limits<double>::infinity();
+  double pvt_increment_rmse =
+      std::numeric_limits<double>::infinity();
+  double pvt_increment_max =
+      std::numeric_limits<double>::infinity();
+  double pvt_pearson_last_healthy_time =
+      -std::numeric_limits<double>::infinity();
+  bool pvt_innovation_quarantined = false;
+  int pvt_innovation_consecutive_rejects = 0;
+  int pvt_innovation_consecutive_accepts = 0;
+  bool pvt_graph_rebuild_required = false;
   double gnss_pvt_loop_min_distance = 5.0;
   double gnss_pvt_loop_time_tolerance = 0.2;
   int gnss_pvt_loop_trigger_count = 3;
@@ -827,6 +952,21 @@ public:
   pcl::PointCloud<PointType> gnss_pvt_ecef_path;
   pcl::PointCloud<PointType> gnss_spp_local_path;
   pcl::PointCloud<PointType> gnss_tc_local_path;
+  struct PvtTrajectoryMeasurement
+  {
+    double timestamp = -1.0;
+    Eigen::Vector3d ecef = Eigen::Vector3d::Zero();
+  };
+  mutex mtx_pvt_visualization;
+  deque<PvtTrajectoryMeasurement> pending_pvt_trajectory;
+  bool pvt_visualization_alignment_ready = false;
+  Eigen::Vector3d pvt_visualization_origin_ecef = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d pvt_visualization_R_ecef_enu =
+      Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d pvt_visualization_R_enu_local =
+      Eigen::Matrix3d::Identity();
+  Eigen::Vector3d pvt_visualization_t_enu_local =
+      Eigen::Vector3d::Zero();
 
   struct LoopPvtConstraint
   {
@@ -841,6 +981,9 @@ public:
     double timestamp = -1.0;
     Eigen::Vector3d ecef = Eigen::Vector3d::Zero();
     Eigen::Vector3d variances = Eigen::Vector3d::Ones();
+    int raw_observations = 0;
+    double raw_time_error = std::numeric_limits<double>::infinity();
+    bool raw_gate_ready = false;
   };
   struct PvtAlignmentSample
   {
@@ -850,11 +993,16 @@ public:
     Eigen::Matrix3d lidar_rotation = Eigen::Matrix3d::Identity();
     Eigen::Vector3d pvt_enu = Eigen::Vector3d::Zero();
     Eigen::Vector3d variances = Eigen::Vector3d::Ones();
+    int raw_observations = 0;
+    double raw_time_error = std::numeric_limits<double>::infinity();
+    bool raw_gate_ready = false;
+    bool lidar_degenerate = false;
     int session_id = -1;
     int pose_id = -1;
   };
   deque<RawLoopPvtMeasurement> raw_pvt_loop_measurements;
   deque<PvtAlignmentSample> pvt_alignment_samples;
+  deque<PvtAlignmentSample> pvt_pearson_samples;
   bool pvt_alignment_initialized = false;
   bool pvt_alignment_ready = false;
   bool have_previous_pvt_loop_pose = false;
@@ -1032,6 +1180,47 @@ public:
         p_gnss->min_hor_vel = gnss_min_hor_vel;
         n.param<bool>("GNSS/tdcp_doppler_ieskf_enable", gnss_tdcp_doppler_ieskf_enable, false);
         n.param<bool>("GNSS/pvt_loop_enable", gnss_pvt_loop_enable, true);
+        n.param<bool>("GNSS/pvt_hba_enable", gnss_pvt_hba_enable, true);
+        n.param<bool>("GNSS/pgo_include_degenerate_poses",
+                      gnss_pgo_include_degenerate_poses, true);
+        n.param<double>("GNSS/degenerate_odom_rotation_std",
+                        gnss_degenerate_odom_rotation_std, 0.0872664626);
+        n.param<double>("GNSS/degenerate_odom_translation_std",
+                        gnss_degenerate_odom_translation_std, 2.0);
+        n.param<int>("GNSS/pvt_hba_min_keyframes",
+                     gnss_pvt_hba_min_keyframes, 20);
+        n.param<double>("GNSS/pvt_hba_min_interval",
+                        gnss_pvt_hba_min_interval, 60.0);
+        n.param<double>("GNSS/pvt_loop_max_innovation",
+                        gnss_pvt_loop_max_innovation, 5.0);
+        n.param<double>("GNSS/pvt_loop_max_mahalanobis",
+                        gnss_pvt_loop_max_mahalanobis, 6.0);
+        n.param<int>("GNSS/pvt_loop_quarantine_reject_count",
+                     gnss_pvt_loop_quarantine_reject_count, 2);
+        n.param<int>("GNSS/pvt_loop_recovery_accept_count",
+                     gnss_pvt_loop_recovery_accept_count, 5);
+        n.param<double>("GNSS/pvt_loop_rollback_seconds",
+                        gnss_pvt_loop_rollback_seconds, 30.0);
+        n.param<bool>("GNSS/pvt_pearson_enable",
+                      gnss_pvt_pearson_enable, true);
+        n.param<int>("GNSS/pvt_pearson_window_size",
+                     gnss_pvt_pearson_window_size, 30);
+        n.param<int>("GNSS/pvt_pearson_min_samples",
+                     gnss_pvt_pearson_min_samples, 15);
+        n.param<double>("GNSS/pvt_pearson_threshold",
+                        gnss_pvt_pearson_threshold, 0.90);
+        n.param<double>("GNSS/pvt_pearson_min_baseline",
+                        gnss_pvt_pearson_min_baseline, 5.0);
+        n.param<double>("GNSS/pvt_increment_rmse_threshold",
+                        gnss_pvt_increment_rmse_threshold, 0.50);
+        n.param<double>("GNSS/pvt_increment_max_error",
+                        gnss_pvt_increment_max_error, 1.50);
+        n.param<int>("GNSS/pvt_pearson_recovery_count",
+                     gnss_pvt_pearson_recovery_count, 3);
+        n.param<int>("GNSS/pvt_pearson_reject_count",
+                     gnss_pvt_pearson_reject_count, 2);
+        n.param<double>("GNSS/pvt_pearson_degenerate_hold_time",
+                        gnss_pvt_pearson_degenerate_hold_time, 10.0);
         n.param<double>("GNSS/pvt_loop_min_distance", gnss_pvt_loop_min_distance, 5.0);
         n.param<double>("GNSS/pvt_loop_time_tolerance", gnss_pvt_loop_time_tolerance, 0.2);
         n.param<int>("GNSS/pvt_loop_trigger_count", gnss_pvt_loop_trigger_count, 3);
@@ -1044,10 +1233,53 @@ public:
         n.param<double>("GNSS/pvt_alignment_rotation_prior_std", gnss_pvt_alignment_rotation_prior_std, 0.35);
         n.param<double>("GNSS/pvt_alignment_translation_prior_std", gnss_pvt_alignment_translation_prior_std, 100.0);
         n.param<double>("GNSS/pvt_alignment_lever_prior_std", gnss_pvt_alignment_lever_prior_std, 1.0);
-        n.param<double>("GNSS/pvt_recovery_time", gnss_pvt_recovery_time, 10.0);
         n.param<double>("GNSS/pvt_covariance_scale", gnss_pvt_covariance_scale, 100.0);
         n.param<int>("GNSS/pvt_min_num_sv", gnss_pvt_min_num_sv, 6);
+        n.param<bool>("GNSS/pvt_require_raw_observations",
+                      gnss_pvt_require_raw_observations, true);
+        n.param<double>("GNSS/pvt_raw_time_tolerance",
+                        gnss_pvt_raw_time_tolerance, 0.2);
+        n.param<int>("GNSS/pvt_raw_recovery_count",
+                     gnss_pvt_raw_recovery_count, 5);
         gnss_pvt_loop_trigger_count = max(1, gnss_pvt_loop_trigger_count);
+        gnss_pvt_hba_min_keyframes = max(10, gnss_pvt_hba_min_keyframes);
+        gnss_pvt_hba_min_interval = max(0.0, gnss_pvt_hba_min_interval);
+        gnss_degenerate_odom_rotation_std =
+            max(1e-3, gnss_degenerate_odom_rotation_std);
+        gnss_degenerate_odom_translation_std =
+            max(0.05, gnss_degenerate_odom_translation_std);
+        gnss_pvt_loop_max_innovation =
+            max(0.1, gnss_pvt_loop_max_innovation);
+        gnss_pvt_loop_max_mahalanobis =
+            max(1.0, gnss_pvt_loop_max_mahalanobis);
+        gnss_pvt_loop_quarantine_reject_count =
+            max(1, gnss_pvt_loop_quarantine_reject_count);
+        gnss_pvt_loop_recovery_accept_count =
+            max(1, gnss_pvt_loop_recovery_accept_count);
+        gnss_pvt_loop_rollback_seconds =
+            max(0.0, gnss_pvt_loop_rollback_seconds);
+        gnss_pvt_pearson_window_size =
+            max(5, gnss_pvt_pearson_window_size);
+        gnss_pvt_pearson_min_samples =
+            min(gnss_pvt_pearson_window_size,
+                max(3, gnss_pvt_pearson_min_samples));
+        gnss_pvt_pearson_threshold =
+            min(1.0, max(-1.0, gnss_pvt_pearson_threshold));
+        gnss_pvt_pearson_min_baseline =
+            max(0.1, gnss_pvt_pearson_min_baseline);
+        gnss_pvt_increment_rmse_threshold =
+            max(0.01, gnss_pvt_increment_rmse_threshold);
+        gnss_pvt_increment_max_error =
+            max(gnss_pvt_increment_rmse_threshold,
+                gnss_pvt_increment_max_error);
+        gnss_pvt_pearson_recovery_count =
+            max(1, gnss_pvt_pearson_recovery_count);
+        gnss_pvt_pearson_reject_count =
+            max(1, gnss_pvt_pearson_reject_count);
+        gnss_pvt_pearson_degenerate_hold_time =
+            max(0.0, gnss_pvt_pearson_degenerate_hold_time);
+        if(!gnss_pvt_pearson_enable)
+          pvt_pearson_available = true;
         gnss_pvt_huber_threshold = max(1e-3, gnss_pvt_huber_threshold);
         gnss_pvt_alignment_min_samples = max(3, gnss_pvt_alignment_min_samples);
         gnss_pvt_alignment_max_samples =
@@ -1060,9 +1292,12 @@ public:
             max(1e-3, gnss_pvt_alignment_translation_prior_std);
         gnss_pvt_alignment_lever_prior_std =
             max(1e-3, gnss_pvt_alignment_lever_prior_std);
-        gnss_pvt_recovery_time = max(0.0, gnss_pvt_recovery_time);
         gnss_pvt_covariance_scale = max(1.0, gnss_pvt_covariance_scale);
         gnss_pvt_min_num_sv = max(4, gnss_pvt_min_num_sv);
+        gnss_pvt_raw_time_tolerance =
+            max(1e-3, gnss_pvt_raw_time_tolerance);
+        gnss_pvt_raw_recovery_count =
+            max(1, gnss_pvt_raw_recovery_count);
 
         n.param<double>("GNSS/psr_std_thres", gnss_psr_std_thres, 2.0);
         n.param<double>("GNSS/dopp_std_thres", gnss_dopp_std_thres, 2.0);
@@ -1222,8 +1457,65 @@ public:
         std::isfinite(msg->latitude) &&
         std::isfinite(msg->longitude) &&
         std::isfinite(msg->altitude);
+
+    int raw_observations = 0;
+    double raw_time_error = std::numeric_limits<double>::infinity();
+    double raw_epoch_timestamp =
+        -std::numeric_limits<double>::infinity();
+    {
+      lock_guard<mutex> lock(mGnssRawHealth);
+      for(auto iter = gnss_raw_health_epochs.rbegin();
+          iter != gnss_raw_health_epochs.rend(); ++iter)
+      {
+        const double time_error =
+            std::fabs(iter->timestamp - pvt_gnss_time);
+        if(time_error < raw_time_error)
+        {
+          raw_time_error = time_error;
+          raw_observations = iter->observations;
+          raw_epoch_timestamp = iter->timestamp;
+        }
+        if(iter->timestamp < pvt_gnss_time - gnss_pvt_raw_time_tolerance &&
+           raw_time_error <= gnss_pvt_raw_time_tolerance)
+          break;
+      }
+    }
+    const int required_raw_observations =
+        p_gnss ? static_cast<int>(p_gnss->min_obs) : max(gnss_min_obs, 4);
+    const bool raw_epoch_healthy =
+        std::isfinite(raw_epoch_timestamp) &&
+        raw_time_error <= gnss_pvt_raw_time_tolerance &&
+        raw_observations >= required_raw_observations;
+    if(raw_epoch_healthy)
+    {
+      if(raw_epoch_timestamp != gnss_pvt_raw_last_counted_timestamp)
+      {
+        ++gnss_pvt_raw_consecutive_healthy;
+        gnss_pvt_raw_last_counted_timestamp = raw_epoch_timestamp;
+      }
+    }
+    else
+    {
+      gnss_pvt_raw_consecutive_healthy = 0;
+      gnss_pvt_raw_last_counted_timestamp = raw_epoch_timestamp;
+    }
+    const bool raw_gate_ready =
+        !gnss_pvt_require_raw_observations ||
+        (raw_epoch_healthy &&
+         gnss_pvt_raw_consecutive_healthy >= gnss_pvt_raw_recovery_count);
+    if(gnss_pvt_require_raw_observations && !raw_gate_ready)
+    {
+      ROS_WARN_THROTTLE(
+          1.0, "PVT raw-observation hold: raw=%d required=%d "
+          "dt=%.3f/max=%.3f recovery=%d/%d",
+          raw_observations, required_raw_observations, raw_time_error,
+          gnss_pvt_raw_time_tolerance,
+          gnss_pvt_raw_consecutive_healthy,
+          gnss_pvt_raw_recovery_count);
+    }
     const bool quality_good =
         position_fix_valid &&
+        raw_gate_ready &&
         msg->num_sv >= gnss_pvt_min_num_sv &&
         std::isfinite(msg->h_acc) && msg->h_acc > 0.0 &&
         std::isfinite(msg->v_acc) && msg->v_acc > 0.0 &&
@@ -1242,12 +1534,15 @@ public:
     {
       if(gnss_pvt_quality_was_good)
       {
-        ROS_WARN("PVT quality lost; recovery timer reset: fix=%u sv=%u "
+        ROS_WARN("PVT quality lost: fix=%u sv=%u "
                  "h_acc=%.3f v_acc=%.3f vel_acc=%.3f",
                  msg->fix_type, msg->num_sv,
                  msg->h_acc, msg->v_acc, msg->vel_acc);
+        // Do not let measurements collected immediately before loss of lock
+        // remain in the queue and get associated with much later loop poses.
+        lock_guard<mutex> lock(mtx_pvt_loop);
+        raw_pvt_loop_measurements.clear();
       }
-      gnss_pvt_good_since = -1.0;
       gnss_pvt_quality_was_good = false;
       if(std::isfinite(pvt_gnss_time))
         gnss_pvt_last_timestamp = pvt_gnss_time;
@@ -1256,27 +1551,19 @@ public:
     {
       if(!gnss_pvt_quality_was_good || !timestamp_continuous)
       {
-        gnss_pvt_good_since = pvt_gnss_time;
-        ROS_INFO("PVT quality recovered; waiting %.1f s before enabling "
-                 "absolute position factors.", gnss_pvt_recovery_time);
+        if(gnss_pvt_quality_was_good && !timestamp_continuous)
+        {
+          lock_guard<mutex> lock(mtx_pvt_loop);
+          raw_pvt_loop_measurements.clear();
+          ROS_WARN("PVT timestamp discontinuity; cleared pending loop factors.");
+        }
+        ROS_INFO("PVT quality recovered; absolute position factors enabled.");
       }
       gnss_pvt_quality_was_good = true;
       gnss_pvt_last_timestamp = pvt_gnss_time;
     }
 
-    const double healthy_duration =
-        quality_good && gnss_pvt_good_since >= 0.0 ?
-        pvt_gnss_time - gnss_pvt_good_since : 0.0;
-    const bool pvt_factor_quality_ready =
-        quality_good && healthy_duration >= gnss_pvt_recovery_time;
-    if(quality_good && !pvt_factor_quality_ready)
-    {
-      ROS_WARN_THROTTLE(
-          1.0, "PVT recovery hold: stable=%.1f/%.1f s sv=%u "
-          "h_acc=%.3f v_acc=%.3f",
-          healthy_duration, gnss_pvt_recovery_time,
-          msg->num_sv, msg->h_acc, msg->v_acc);
-    }
+    const bool pvt_factor_quality_ready = quality_good;
 
     if(gnss_ready && pvt_factor_quality_ready)
     {
@@ -1297,6 +1584,9 @@ public:
           covariance_scale * horizontal_sigma * horizontal_sigma,
           covariance_scale * horizontal_sigma * horizontal_sigma,
           covariance_scale * vertical_sigma * vertical_sigma;
+      measurement.raw_observations = raw_observations;
+      measurement.raw_time_error = raw_time_error;
+      measurement.raw_gate_ready = raw_gate_ready;
       if(measurement.ecef.allFinite() &&
          measurement.variances.allFinite())
       {
@@ -1311,15 +1601,56 @@ public:
     if(!gnss_ready || !position_fix_valid)
       return;
 
-    Eigen::Vector3d lla(msg->latitude, msg->longitude, msg->altitude);
-    Eigen::Vector3d fix_ecef = gnss_comm::geo2ecef(lla);
-    PointType pt;
-    pt.x = fix_ecef.x();
-    pt.y = fix_ecef.y();
-    pt.z = fix_ecef.z();
-    pt.intensity = 0.0;
-    pt.curvature = pvt_gnss_time - gnss_local_time_diff;
-    gnss_pvt_ecef_path.push_back(pt);
+    const Eigen::Vector3d fix_ecef = gnss_comm::geo2ecef(
+        Eigen::Vector3d(msg->latitude, msg->longitude, msg->altitude));
+    if(!fix_ecef.allFinite())
+      return;
+
+    pcl::PointCloud<PointType> trajectory_to_publish;
+    {
+      lock_guard<mutex> lock(mtx_pvt_visualization);
+      PvtTrajectoryMeasurement trajectory_measurement;
+      trajectory_measurement.timestamp =
+          pvt_gnss_time - gnss_local_time_diff;
+      trajectory_measurement.ecef = fix_ecef;
+      pending_pvt_trajectory.push_back(trajectory_measurement);
+      while(pending_pvt_trajectory.size() >
+            static_cast<size_t>(2 * gnss_pvt_alignment_max_samples))
+        pending_pvt_trajectory.pop_front();
+
+      PointType ecef_point{};
+      ecef_point.x = fix_ecef.x();
+      ecef_point.y = fix_ecef.y();
+      ecef_point.z = fix_ecef.z();
+      ecef_point.curvature = trajectory_measurement.timestamp;
+      gnss_pvt_ecef_path.push_back(ecef_point);
+
+      if(pvt_visualization_alignment_ready)
+      {
+        for(const PvtTrajectoryMeasurement &measurement :
+            pending_pvt_trajectory)
+        {
+          const Eigen::Vector3d pvt_enu =
+              pvt_visualization_R_ecef_enu.transpose() *
+              (measurement.ecef - pvt_visualization_origin_ecef);
+          const Eigen::Vector3d antenna_local =
+              pvt_visualization_R_enu_local.transpose() *
+              (pvt_enu - pvt_visualization_t_enu_local);
+          if(!antenna_local.allFinite())
+            continue;
+          PointType point{};
+          point.x = antenna_local.x();
+          point.y = antenna_local.y();
+          point.z = antenna_local.z();
+          point.curvature = measurement.timestamp;
+          gnss_pvt_local_path.push_back(point);
+        }
+        pending_pvt_trajectory.clear();
+        trajectory_to_publish = gnss_pvt_local_path;
+      }
+    }
+    if(!trajectory_to_publish.empty())
+      pub_pl_func(trajectory_to_publish, pub_gnss_pvt_local);
   }
 
   bool pvt_quality_check(const gnss_comm::PVTSolutionPtr &pvt) const
@@ -1976,17 +2307,17 @@ public:
       {
         p_gnss->para_rcv_ddt[0] +=
             last_gnss_normal.clock_drift_correction;
-        ROS_INFO("LIO+GNSS ESIKF: lidar_hessian=%s lidar_residual=%s "
-                 "matches=%d retained_directions=%d/6 tdcp=%d doppler=%d "
-                 "chi2_rejected=%d ddt_correction=%.4f",
-          lidar_hessian_well_conditioned ? "well-conditioned" : "ill-conditioned",
-          lidar_hessian_well_conditioned ? "full" : "projected",
-          match_num,
-          lidar_retained_directions,
-          last_gnss_normal.tdcp_accepted,
-          last_gnss_normal.doppler_accepted,
-          last_gnss_normal.chi_square_rejected,
-          last_gnss_normal.clock_drift_correction);
+        // ROS_INFO("LIO+GNSS ESIKF: lidar_hessian=%s lidar_residual=%s "
+        //          "matches=%d retained_directions=%d/6 tdcp=%d doppler=%d "
+        //          "chi2_rejected=%d ddt_correction=%.4f",
+        //   lidar_hessian_well_conditioned ? "well-conditioned" : "ill-conditioned",
+        //   lidar_hessian_well_conditioned ? "full" : "projected",
+        //   match_num,
+        //   lidar_retained_directions,
+        //   last_gnss_normal.tdcp_accepted,
+        //   last_gnss_normal.doppler_accepted,
+        //   last_gnss_normal.chi_square_rejected,
+        //   last_gnss_normal.clock_drift_correction);
       }
       else
       {
@@ -2165,23 +2496,109 @@ public:
 
   bool local_map_update_ready() const
   {
-    if(win_count <= 0 ||
-       x_buf.size() < static_cast<size_t>(win_count) ||
-       pvec_buf.size() < static_cast<size_t>(win_count) ||
-       pcl_path.empty())
-      return false;
+    // A rigid backend handoff does not run local BA and is safe for a
+    // geometrically weak window.  Blocking it on low_lidar_structure would
+    // deadlock the loop thread exactly when RTK-aided PGO is needed most.
+    return win_count > 0 &&
+           x_buf.size() >= static_cast<size_t>(win_count) &&
+           pvec_buf.size() >= static_cast<size_t>(win_count) &&
+           !pcl_path.empty();
+  }
 
-    return std::find(
-               low_lidar_structure_buf.begin(),
-               low_lidar_structure_buf.end(), true) ==
-           low_lidar_structure_buf.end();
+  bool has_pending_map_loop()
+  {
+    lock_guard<mutex> map_lock(mtx_map_handoff);
+    return !map_loop.empty();
+  }
+
+  void correct_full_path_from_backend_anchors(
+      const map<int, Eigen::Vector3d> &target_positions,
+      const IMUST &fallback_correction)
+  {
+    struct PathCorrectionAnchor
+    {
+      size_t frame_id = 0;
+      Eigen::Vector3d target = Eigen::Vector3d::Zero();
+      Eigen::Vector3d correction = Eigen::Vector3d::Zero();
+    };
+    vector<PathCorrectionAnchor> anchors;
+    anchors.reserve(target_positions.size());
+    for(const auto &entry : target_positions)
+    {
+      if(entry.first < 0 ||
+         static_cast<size_t>(entry.first) >= pcl_path.size() ||
+         !entry.second.allFinite())
+        continue;
+      const PointType &point = pcl_path.points[entry.first];
+      const Eigen::Vector3d original(point.x, point.y, point.z);
+      if(!original.allFinite())
+        continue;
+      PathCorrectionAnchor anchor;
+      anchor.frame_id = static_cast<size_t>(entry.first);
+      anchor.target = entry.second;
+      anchor.correction = entry.second - original;
+      anchors.push_back(anchor);
+    }
+
+    if(anchors.empty())
+    {
+      for(PointType &point : pcl_path.points)
+      {
+        Eigen::Vector3d position(point.x, point.y, point.z);
+        position = fallback_correction.R * position + fallback_correction.p;
+        point.x = position.x();
+        point.y = position.y();
+        point.z = position.z();
+      }
+      ROS_WARN("PGO path correction used rigid fallback: no frame anchors.");
+      return;
+    }
+
+    size_t right = 0;
+    for(size_t frame_id = 0; frame_id < pcl_path.size(); ++frame_id)
+    {
+      while(right < anchors.size() && anchors[right].frame_id < frame_id)
+        ++right;
+      Eigen::Vector3d correction;
+      if(right == 0)
+        correction = anchors.front().correction;
+      else if(right >= anchors.size())
+        correction = anchors.back().correction;
+      else
+      {
+        const PathCorrectionAnchor &left = anchors[right - 1];
+        const PathCorrectionAnchor &right_anchor = anchors[right];
+        const double span = static_cast<double>(
+            right_anchor.frame_id - left.frame_id);
+        const double alpha = span > 0.0 ?
+            static_cast<double>(frame_id - left.frame_id) / span : 1.0;
+        correction =
+            (1.0 - alpha) * left.correction + alpha * right_anchor.correction;
+      }
+      PointType &point = pcl_path.points[frame_id];
+      point.x += correction.x();
+      point.y += correction.y();
+      point.z += correction.z();
+    }
+    for(const PathCorrectionAnchor &anchor : anchors)
+    {
+      PointType &point = pcl_path.points[anchor.frame_id];
+      point.x = anchor.target.x();
+      point.y = anchor.target.y();
+      point.z = anchor.target.z();
+    }
   }
 
   // After detecting loop closure, refine current map and states.
   bool loop_update()
   {
-    if(!local_map_update_ready() || map_loop.empty())
+    if(!local_map_update_ready())
       return false;
+
+    unique_lock<mutex> map_lock(mtx_map_handoff);
+    if(map_loop.empty())
+      return false;
+    const IMUST applied_dx = pending_map_dx;
 
     printf("loop update: %zu\n", sws[0].size());
     double t1 = ros::Time::now().toSec();
@@ -2197,8 +2614,26 @@ public:
     }
     surf_map.clear();
     surf_map_slide.clear();
+
+    // Do not reuse SlideWindow objects from the pre-PGO map.  Their ring
+    // slots belong to the old coordinate/window generation; reusing them
+    // after mp is reset can turn a stale slot into an out-of-bounds vector
+    // write.  PGO is infrequent, so a fresh pool is preferable to risking
+    // heap corruption.
+    unordered_set<SlideWindow*> retired_windows;
+    for(vector<SlideWindow*> &pool : sws)
+    {
+      for(SlideWindow *window : pool)
+        if(window != nullptr)
+          retired_windows.insert(window);
+      pool.clear();
+    }
+    for(SlideWindow *window : retired_windows)
+      delete window;
+
     surf_map.swap(map_loop);
     map_loop.clear();
+    map_lock.unlock();
 
     vector<ScanPose*> pending_loop_poses;
     {
@@ -2209,47 +2644,41 @@ public:
     printf("scanPoses: %zu %zu %zu %d %d %zu\n",
            scanPoses->size(), pending_loop_poses.size(), x_buf.size(),
            win_base, win_count, sws[0].size());
-    int blsize = scanPoses->size();
-    PointType ap = pcl_path[0];
-    pcl_path.clear();
-    
-    for(int i=0; i<blsize; i++)
-    {
-      ap.x = scanPoses->at(i)->x.p[0];
-      ap.y = scanPoses->at(i)->x.p[1];
-      ap.z = scanPoses->at(i)->x.p[2];
-      pcl_path.push_back(ap);
-    }
+    map<int, Eigen::Vector3d> corrected_path_anchors;
+    for(ScanPose *pose : *scanPoses)
+      if(pose != nullptr && pose->frame_id >= 0)
+        corrected_path_anchors[pose->frame_id] = pose->x.p;
 
     for(ScanPose *bl: pending_loop_poses)
     {
       if(bl == nullptr)
         continue;
-      bl->update(dx);
-      ap.x = bl->x.p[0];
-      ap.y = bl->x.p[1];
-      ap.z = bl->x.p[2];
-      pcl_path.push_back(ap);
+      bl->update(applied_dx);
+      if(bl->frame_id >= 0)
+        corrected_path_anchors[bl->frame_id] = bl->x.p;
     }
     
+    const bool rotate_gravity =
+        g_update == 1 ||
+        rotate_gravity_on_map_update.load(std::memory_order_acquire);
     for(int i=0; i<win_count; i++)
     {
       IMUST &x = x_buf[i];
-      x.v = dx.R * x.v;
-      x.p = dx.R * x.p + dx.p;
-      x.R = dx.R * x.R;
-      if(g_update == 1)
-        x.g = dx.R * x.g;
-      // PointType ap;
-      ap.x = x.p[0]; ap.y = x.p[1]; ap.z = x.p[2];
-      pcl_path.push_back(ap);
+      x.v = applied_dx.R * x.v;
+      x.p = applied_dx.R * x.p + applied_dx.p;
+      x.R = applied_dx.R * x.R;
+      if(rotate_gravity)
+        x.g = applied_dx.R * x.g;
+      corrected_path_anchors[win_base + i] = x.p;
     }
 
+    correct_full_path_from_backend_anchors(
+        corrected_path_anchors, applied_dx);
     pub_pl_func(pcl_path, pub_curr_path);
 
     x_curr.R = x_buf[win_count-1].R;
     x_curr.p = x_buf[win_count-1].p;
-    x_curr.v = dx.R * x_curr.v;
+    x_curr.v = applied_dx.R * x_curr.v;
     x_curr.g = x_buf[win_count-1].g;
     
     for(int i=0; i<win_size; i++)
@@ -2278,6 +2707,7 @@ public:
     for(auto iter=surf_map.begin(); iter!=surf_map.end(); ++iter)
       iter->second->recut(win_count, x_buf, sws[0]);
 
+    rotate_gravity_on_map_update.store(false, std::memory_order_release);
     if(g_update == 1) g_update = 2;
     loop_detect.store(0, std::memory_order_release);
     double t2 = ros::Time::now().toSec();
@@ -2288,6 +2718,9 @@ public:
   // load the previous keyframe in the local voxel map
   void keyframe_loading(double jour)
   {
+    unique_lock<mutex> history_lock(mtx_history_map, defer_lock);
+    unique_lock<mutex> keyframe_lock(mtx_keyframe, defer_lock);
+    lock(history_lock, keyframe_lock);
     if(history_kfsize <= 0) return;
     double tt1 = ros::Time::now().toSec();
     PointType ap_curr;
@@ -2413,15 +2846,26 @@ public:
     gnss_candidate_initialized = false;
     gnss_candidate_valid = false;
     gnss_rcv_dt.clear();
-    gnss_pvt_good_since = -1.0;
     gnss_pvt_last_timestamp = -1.0;
     gnss_pvt_quality_was_good = false;
+    gnss_pvt_raw_consecutive_healthy = 0;
+    gnss_pvt_raw_last_counted_timestamp =
+        -std::numeric_limits<double>::infinity();
     
     if(p_gnss)
       p_gnss->Reset();
     gnss_fix_local_path.clear();
-    gnss_pvt_local_path.clear();
-    gnss_pvt_ecef_path.clear();
+    {
+      lock_guard<mutex> lock(mtx_pvt_visualization);
+      gnss_pvt_local_path.clear();
+      gnss_pvt_ecef_path.clear();
+      pending_pvt_trajectory.clear();
+      pvt_visualization_alignment_ready = false;
+      pvt_visualization_origin_ecef.setZero();
+      pvt_visualization_R_ecef_enu.setIdentity();
+      pvt_visualization_R_enu_local.setIdentity();
+      pvt_visualization_t_enu_local.setZero();
+    }
     gnss_spp_local_path.clear();
     gnss_tc_local_path.clear();
     {
@@ -2431,30 +2875,23 @@ public:
     {
       lock_guard<mutex> lock(mtx_pvt_loop);
       raw_pvt_loop_measurements.clear();
-      pvt_alignment_samples.clear();
-      accepted_pvt_loop_constraints.clear();
-      have_last_pvt_loop_position = false;
-      last_pvt_loop_position.setZero();
-      pvt_alignment_initialized = false;
-      pvt_alignment_ready = false;
-      have_previous_pvt_loop_pose = false;
-      pvt_alignment_origin_ecef.setZero();
-      pvt_R_ecef_enu.setIdentity();
-      pvt_R_enu_local.setIdentity();
-      pvt_R_enu_local_prior.setIdentity();
-      pvt_t_enu_local.setZero();
-      pvt_t_enu_local_prior.setZero();
-      pvt_Tex_imu_r.setZero();
-      pvt_Tex_imu_r_prior.setZero();
       pvt_enu_odom_ready = false;
       pvt_enu_odom_R_enu_local.setIdentity();
       pvt_enu_odom_t_enu_local.setZero();
     }
+    // Alignment/Pearson/accepted-factor containers are owned by the loop
+    // thread.  Request an in-thread reset instead of clearing them here while
+    // that thread may be iterating or appending.
+    pvt_backend_reset_requested.store(true, std::memory_order_release);
     {
       lock_guard<mutex> lock(mGnssMeasBuf);
       gnss_meas_sync_buf.clear();
       queue<vector<gnss_comm::ObsPtr>> empty_gnss_meas;
       gnss_meas_buf.swap(empty_gnss_meas);
+    }
+    {
+      lock_guard<mutex> lock(mGnssRawHealth);
+      gnss_raw_health_epochs.clear();
     }
     gnss_tdcp_prev_valid = false;
     gnss_tdcp_prev_time = 0.0;
@@ -2488,13 +2925,14 @@ public:
     // }
     // return;
 
-    int thd_num = thread_num;
+    const int g_size = feat_map.size();
+    if(g_size == 0)
+      return;
+    const int thd_num = std::min(std::max(1, thread_num), g_size);
     vector<vector<OctoTree*>*> octs;
     for(int i=0; i<thd_num; i++) 
       octs.push_back(new vector<OctoTree*>());
 
-    int g_size = feat_map.size();
-    if(g_size < thd_num) return;
     vector<thread*> mthreads(thd_num);
     double part = 1.0 * g_size / thd_num;
     int cnt = 0;
@@ -2557,10 +2995,19 @@ public:
     //   iter->second->tras_opt(voxopt);
     // }
 
-    int thd_num = thread_num;
-    vector<vector<OctoTree*>> octss(thd_num);
     int g_size = feat_map.size();
-    if(g_size < thd_num) return;
+    if(g_size == 0)
+      return;
+    if(sws.empty())
+    {
+      ROS_ERROR_THROTTLE(
+          1.0, "Skip voxel recut: SlideWindow pool list is empty.");
+      return;
+    }
+    const int thd_num = std::min(
+        std::min(std::max(1, thread_num), g_size),
+        static_cast<int>(sws.size()));
+    vector<vector<OctoTree*>> octss(thd_num);
     vector<thread*> mthreads(thd_num);
     double part = 1.0 * g_size / thd_num;
     int cnt = 0;
@@ -2636,7 +3083,7 @@ public:
     {
       if(loop_detect.load(std::memory_order_acquire) == 1)
       {
-        if(map_loop.empty())
+        if(!has_pending_map_loop())
         {
           ROS_WARN_THROTTLE(
               1.0,
@@ -2790,12 +3237,12 @@ public:
               pcl_curr->points.end());
           pcl_curr->width = pcl_curr->points.size();
           pcl_curr->height = 1;
-          ROS_WARN_THROTTLE(
-              1.0,
-              "Temporary lidar max range filter: %.2f m, kept %lu/%lu points.",
-              lidar_max_range,
-              static_cast<unsigned long>(pcl_curr->size()),
-              static_cast<unsigned long>(original_size));
+          // ROS_WARN_THROTTLE(
+          //     1.0,
+          //     "Temporary lidar max range filter: %.2f m, kept %lu/%lu points.",
+          //     lidar_max_range,
+          //     static_cast<unsigned long>(pcl_curr->size()),
+          //     static_cast<unsigned long>(original_size));
         }
 
         pcl::PointCloud<PointType> pl_down = *pcl_curr;
@@ -2974,10 +3421,13 @@ public:
             mtx_loop.lock();
             buf_lba2loop_tem.swap(buf_lba2loop);
             mtx_loop.unlock();
-            reset_flag = 1;
+            reset_flag.store(1, std::memory_order_release);
 
             motion_init_flag = 1;
-            history_kfsize = 0;
+            {
+              lock_guard<mutex> history_lock(mtx_history_map);
+              history_kfsize = 0;
+            }
             consecutive_lidar_degenerate_frames = 0;
             frames_since_valid_gnss_ieskf =
                 kRecoveryGnssMaximumAgeFrames + 1;
@@ -2994,8 +3444,17 @@ public:
             std::find(low_lidar_structure_buf.begin(),
                       low_lidar_structure_buf.end(), true) !=
             low_lidar_structure_buf.end();
+        const bool lidar_factor_valid = voxhess.valid();
+        if(!lidar_factor_valid)
+        {
+          ROS_ERROR_THROTTLE(
+              1.0,
+              "Local BA factor layout is inconsistent; skip BA and "
+              "marginalization for this window to protect heap state.");
+        }
 
-        if(!window_contains_low_lidar_structure && g_update == 2)
+        if(lidar_factor_valid && !window_contains_low_lidar_structure &&
+           g_update == 2)
         {
           LI_BA_OptimizerGravity opt_lsv;
           vector<double> resis;
@@ -3004,7 +3463,7 @@ public:
           g_update = 0;
           x_curr.g = x_buf[win_count-1].g;
         }
-        else if(!window_contains_low_lidar_structure)
+        else if(lidar_factor_valid && !window_contains_low_lidar_structure)
         {
           LI_BA_Optimizer opt_lsv;
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
@@ -3016,11 +3475,43 @@ public:
               "Local BA paused: active window contains low-lidar-structure states.");
         }
 
-        if(!window_contains_low_lidar_structure)
+        const bool hba_eligible_pose =
+            lidar_factor_valid && !window_contains_low_lidar_structure;
+        const bool enqueue_degenerate_pose =
+            !hba_eligible_pose && GNSS_enable &&
+            gnss_pgo_include_degenerate_poses;
+        if(hba_eligible_pose || enqueue_degenerate_pose)
         {
-          ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
-          bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-          for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+          ScanPose *bl = new ScanPose(
+              x_buf[0], hba_eligible_pose ? pvec_buf[0] : nullptr);
+          bl->frame_id = win_base;
+          bl->hba_eligible = hba_eligible_pose;
+          if(hba_eligible_pose)
+          {
+            bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
+            for(int i=0; i<6; i++)
+              bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+          }
+          else
+          {
+            const double rotation_variance =
+                gnss_degenerate_odom_rotation_std *
+                gnss_degenerate_odom_rotation_std;
+            const double translation_variance =
+                gnss_degenerate_odom_translation_std *
+                gnss_degenerate_odom_translation_std;
+            bl->v6 << rotation_variance, rotation_variance,
+                      rotation_variance, translation_variance,
+                      translation_variance, translation_variance;
+            ROS_WARN_THROTTLE(
+                1.0,
+                "Queued lidar-degenerate pose for RTK-aided PGO: "
+                "t=%.3f tdcp_doppler_aided=%d odom_std=[%.3f rad %.3f m].",
+                bl->x.t,
+                last_gnss_ieskf_update_valid,
+                gnss_degenerate_odom_rotation_std,
+                gnss_degenerate_odom_translation_std);
+          }
           mtx_loop.lock();
           buf_lba2loop.push_back(bl);
           mtx_loop.unlock();
@@ -3042,7 +3533,8 @@ public:
         // Marginalization promotes old sliding-window points into pcr_fix.
         // Keep doing this while degraded so surf_map remains usable when
         // LiDAR geometry returns.
-        multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
+        if(lidar_factor_valid)
+          multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
         t6 = ros::Time::now().toSec();
 
         if(!window_contains_low_lidar_structure &&
@@ -3147,6 +3639,10 @@ public:
       const RawLoopPvtMeasurement &measurement,
       const PvtAlignmentSample &pose)
   {
+    // Degenerate poses may receive RTK factors after the coordinate
+    // alignment is known, but they must not bootstrap that alignment.
+    if(pose.lidar_degenerate && !pvt_alignment_ready)
+      return false;
     if(!pvt_alignment_initialized)
       initialize_pvt_alignment_coordinates(measurement);
 
@@ -3158,6 +3654,9 @@ public:
         pvt_R_ecef_enu.transpose() *
         (measurement.ecef - pvt_alignment_origin_ecef);
     sample.variances = measurement.variances;
+    sample.raw_observations = measurement.raw_observations;
+    sample.raw_time_error = measurement.raw_time_error;
+    sample.raw_gate_ready = measurement.raw_gate_ready;
     if(!sample.pvt_enu.allFinite())
       return false;
 
@@ -3306,12 +3805,394 @@ public:
 
     pvt_alignment_ready = true;
     {
+      lock_guard<mutex> lock(mtx_pvt_visualization);
+      pvt_visualization_origin_ecef = pvt_alignment_origin_ecef;
+      pvt_visualization_R_ecef_enu = pvt_R_ecef_enu;
+      pvt_visualization_R_enu_local = pvt_R_enu_local;
+      pvt_visualization_t_enu_local = pvt_t_enu_local;
+      pvt_visualization_alignment_ready = true;
+    }
+    {
       lock_guard<mutex> lock(mtx_pvt_loop);
       pvt_enu_odom_R_enu_local = pvt_R_enu_local;
       pvt_enu_odom_t_enu_local = pvt_t_enu_local;
       pvt_enu_odom_ready = true;
     }
     return true;
+  }
+
+  void reset_pvt_pearson_gate(const char *reason,
+                              bool preserve_available = false)
+  {
+    const bool was_available = pvt_pearson_available;
+    pvt_pearson_samples.clear();
+    pvt_pearson_consecutive_accepts =
+        preserve_available && was_available ?
+        gnss_pvt_pearson_recovery_count : 0;
+    pvt_pearson_consecutive_rejects = 0;
+    pvt_pearson_score = -std::numeric_limits<double>::infinity();
+    pvt_increment_rmse = std::numeric_limits<double>::infinity();
+    pvt_increment_max = std::numeric_limits<double>::infinity();
+    pvt_pearson_available =
+        !gnss_pvt_pearson_enable ||
+        (preserve_available && was_available);
+    pvt_pearson_latest_accepted = !gnss_pvt_pearson_enable;
+    if(!pvt_pearson_available)
+      pvt_pearson_last_healthy_time =
+          -std::numeric_limits<double>::infinity();
+    if(gnss_pvt_pearson_enable && reason != nullptr)
+      ROS_INFO("PVT Pearson gate reset: %s.", reason);
+  }
+
+  size_t rollback_pvt_constraints_from(double rollback_begin,
+                                       const char *reason)
+  {
+    const size_t old_size = accepted_pvt_loop_constraints.size();
+    accepted_pvt_loop_constraints.erase(
+        std::remove_if(
+            accepted_pvt_loop_constraints.begin(),
+            accepted_pvt_loop_constraints.end(),
+            [rollback_begin](const LoopPvtConstraint &constraint)
+            {
+              return constraint.timestamp >= rollback_begin;
+            }),
+        accepted_pvt_loop_constraints.end());
+    const size_t removed = old_size - accepted_pvt_loop_constraints.size();
+    have_last_pvt_loop_position = !accepted_pvt_loop_constraints.empty();
+    if(have_last_pvt_loop_position)
+      last_pvt_loop_position = accepted_pvt_loop_constraints.back().position;
+    else
+      last_pvt_loop_position.setZero();
+    if(removed > 0)
+      pvt_graph_rebuild_required = true;
+    ROS_WARN(
+        "PVT gate rollback: reason=%s begin=%.3f removed=%zu rebuild=%d.",
+        reason == nullptr ? "unknown" : reason, rollback_begin,
+        removed, pvt_graph_rebuild_required);
+    return removed;
+  }
+
+  bool append_pvt_pearson_sample(const PvtAlignmentSample &sample)
+  {
+    if(!sample.lidar_position.allFinite() ||
+       !sample.lidar_rotation.allFinite() ||
+       !sample.pvt_enu.allFinite() ||
+       sample.lidar_degenerate ||
+       sample.time_error > gnss_pvt_loop_time_tolerance ||
+       (gnss_pvt_require_raw_observations && !sample.raw_gate_ready))
+      return false;
+
+    if(!pvt_pearson_samples.empty() &&
+       pvt_pearson_samples.back().session_id == sample.session_id &&
+       pvt_pearson_samples.back().pose_id == sample.pose_id)
+    {
+      if(sample.time_error < pvt_pearson_samples.back().time_error)
+        pvt_pearson_samples.back() = sample;
+      return false;
+    }
+
+    pvt_pearson_samples.push_back(sample);
+    while(pvt_pearson_samples.size() >
+          static_cast<size_t>(gnss_pvt_pearson_window_size))
+      pvt_pearson_samples.pop_front();
+    return true;
+  }
+
+  bool evaluate_pvt_relative_pearson()
+  {
+    if(!gnss_pvt_pearson_enable)
+    {
+      pvt_pearson_available = true;
+      pvt_pearson_latest_accepted = true;
+      return true;
+    }
+    if(!pvt_alignment_ready ||
+       pvt_pearson_samples.size() <
+           static_cast<size_t>(gnss_pvt_pearson_min_samples))
+    {
+      pvt_pearson_latest_accepted = false;
+      ROS_WARN_THROTTLE(
+          1.0, "PVT Pearson hold: samples=%zu/%d.",
+          pvt_pearson_samples.size(), gnss_pvt_pearson_min_samples);
+      return false;
+    }
+
+    vector<Eigen::Vector3d> lidar_increments;
+    vector<Eigen::Vector3d> rtk_increments;
+    lidar_increments.reserve(pvt_pearson_samples.size() - 1);
+    rtk_increments.reserve(pvt_pearson_samples.size() - 1);
+    double baseline = 0.0;
+    double increment_squared_error = 0.0;
+    double increment_max_error = 0.0;
+    Eigen::Vector3d previous_lidar =
+        pvt_pearson_samples.front().lidar_position;
+    const PvtAlignmentSample &first_sample = pvt_pearson_samples.front();
+    Eigen::Vector3d previous_rtk =
+        pvt_R_enu_local.transpose() *
+            (first_sample.pvt_enu - pvt_t_enu_local) -
+        first_sample.lidar_rotation * pvt_Tex_imu_r;
+    if(!previous_rtk.allFinite())
+      return false;
+
+    for(size_t i = 1; i < pvt_pearson_samples.size(); ++i)
+    {
+      const PvtAlignmentSample &sample = pvt_pearson_samples[i];
+      const Eigen::Vector3d antenna_local =
+          pvt_R_enu_local.transpose() *
+          (sample.pvt_enu - pvt_t_enu_local);
+      const Eigen::Vector3d rtk_body =
+          antenna_local - sample.lidar_rotation * pvt_Tex_imu_r;
+      if(!rtk_body.allFinite())
+        return false;
+      const Eigen::Vector3d lidar_increment =
+          sample.lidar_position - previous_lidar;
+      const Eigen::Vector3d rtk_increment = rtk_body - previous_rtk;
+      lidar_increments.push_back(lidar_increment);
+      rtk_increments.push_back(rtk_increment);
+      const double error = (rtk_increment - lidar_increment).norm();
+      baseline += lidar_increment.norm();
+      increment_squared_error += error * error;
+      increment_max_error = max(increment_max_error, error);
+      previous_lidar = sample.lidar_position;
+      previous_rtk = rtk_body;
+    }
+
+    if(baseline < gnss_pvt_pearson_min_baseline)
+    {
+      pvt_pearson_latest_accepted = false;
+      ROS_WARN_THROTTLE(
+          1.0, "PVT Pearson hold: baseline=%.2f/%.2f m.",
+          baseline, gnss_pvt_pearson_min_baseline);
+      return false;
+    }
+
+    Eigen::Vector3d lidar_mean = Eigen::Vector3d::Zero();
+    Eigen::Vector3d rtk_mean = Eigen::Vector3d::Zero();
+    for(size_t i = 0; i < lidar_increments.size(); ++i)
+    {
+      lidar_mean += lidar_increments[i];
+      rtk_mean += rtk_increments[i];
+    }
+    lidar_mean /= static_cast<double>(lidar_increments.size());
+    rtk_mean /= static_cast<double>(rtk_increments.size());
+
+    Eigen::Matrix3d lidar_covariance = Eigen::Matrix3d::Zero();
+    for(const Eigen::Vector3d &point : lidar_increments)
+    {
+      const Eigen::Vector3d centered = point - lidar_mean;
+      lidar_covariance += centered * centered.transpose();
+    }
+    lidar_covariance /= max(
+        1.0, static_cast<double>(lidar_increments.size() - 1));
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen_solver(
+        lidar_covariance);
+    if(eigen_solver.info() != Eigen::Success)
+      return false;
+
+    const Eigen::Vector3d eigenvalues = eigen_solver.eigenvalues();
+    const Eigen::Matrix3d eigenvectors = eigen_solver.eigenvectors();
+    const double active_variance = max(1e-4, 0.01 * eigenvalues.maxCoeff());
+    double weighted_correlation = 0.0;
+    double weight_sum = 0.0;
+    int active_axes = 0;
+    for(int axis = 0; axis < 3; ++axis)
+    {
+      if(eigenvalues[axis] < active_variance)
+        continue;
+      double covariance = 0.0;
+      double lidar_variance = 0.0;
+      double rtk_variance = 0.0;
+      for(size_t i = 0; i < lidar_increments.size(); ++i)
+      {
+        const double lidar_value = eigenvectors.col(axis).dot(
+            lidar_increments[i] - lidar_mean);
+        const double rtk_value = eigenvectors.col(axis).dot(
+            rtk_increments[i] - rtk_mean);
+        covariance += lidar_value * rtk_value;
+        lidar_variance += lidar_value * lidar_value;
+        rtk_variance += rtk_value * rtk_value;
+      }
+      const double denominator =
+          sqrt(lidar_variance * rtk_variance);
+      if(denominator <= 1e-9)
+        continue;
+      const double correlation =
+          max(-1.0, min(1.0, covariance / denominator));
+      weighted_correlation += eigenvalues[axis] * correlation;
+      weight_sum += eigenvalues[axis];
+      ++active_axes;
+    }
+    if(active_axes == 0 || weight_sum <= 1e-9)
+    {
+      pvt_pearson_latest_accepted = false;
+      return false;
+    }
+
+    pvt_pearson_score = weighted_correlation / weight_sum;
+    pvt_increment_rmse = sqrt(
+        increment_squared_error /
+        max(1.0, static_cast<double>(lidar_increments.size())));
+    pvt_increment_max = increment_max_error;
+    const bool hard_jump =
+        pvt_increment_max > gnss_pvt_increment_max_error;
+    const bool accepted =
+        pvt_pearson_score >= gnss_pvt_pearson_threshold &&
+        pvt_increment_rmse <= gnss_pvt_increment_rmse_threshold &&
+        !hard_jump;
+    pvt_pearson_latest_accepted = accepted;
+    const bool was_available = pvt_pearson_available;
+    if(accepted)
+    {
+      pvt_pearson_last_healthy_time =
+          pvt_pearson_samples.back().timestamp;
+      ++pvt_pearson_consecutive_accepts;
+      pvt_pearson_consecutive_rejects = 0;
+      if(pvt_pearson_consecutive_accepts >=
+         gnss_pvt_pearson_recovery_count)
+        pvt_pearson_available = true;
+    }
+    else
+    {
+      pvt_pearson_consecutive_accepts = 0;
+      ++pvt_pearson_consecutive_rejects;
+      if(hard_jump ||
+         pvt_pearson_consecutive_rejects >=
+             gnss_pvt_pearson_reject_count)
+        pvt_pearson_available = false;
+    }
+
+    if(was_available && !pvt_pearson_available)
+      rollback_pvt_constraints_from(
+          pvt_pearson_samples.front().timestamp,
+          "Pearson consistency lost");
+
+    if(was_available != pvt_pearson_available)
+    {
+      ROS_WARN(
+          "PVT Pearson state changed: available=%d score=%.3f/%.3f "
+          "increment_rmse=%.3f/%.3f max=%.3f/%.3f samples=%zu "
+          "baseline=%.2f m axes=%d.",
+          pvt_pearson_available, pvt_pearson_score,
+          gnss_pvt_pearson_threshold, pvt_increment_rmse,
+          gnss_pvt_increment_rmse_threshold, pvt_increment_max,
+          gnss_pvt_increment_max_error, pvt_pearson_samples.size(),
+          baseline, active_axes);
+    }
+    else
+    {
+      ROS_INFO_THROTTLE(
+          1.0, "PVT Pearson: available=%d score=%.3f "
+          "increment_rmse=%.3f max=%.3f recovery=%d/%d reject=%d/%d.",
+          pvt_pearson_available, pvt_pearson_score,
+          pvt_increment_rmse, pvt_increment_max,
+          pvt_pearson_consecutive_accepts,
+          gnss_pvt_pearson_recovery_count,
+          pvt_pearson_consecutive_rejects,
+          gnss_pvt_pearson_reject_count);
+    }
+    return true;
+  }
+
+  bool pvt_innovation_gate(const PvtAlignmentSample &sample,
+                           const Eigen::Vector3d &body_local,
+                           const Eigen::Vector3d &variances,
+                           double &innovation_norm,
+                           double &mahalanobis)
+  {
+    const Eigen::Vector3d innovation =
+        sample.lidar_position - body_local;
+    innovation_norm = innovation.norm();
+    mahalanobis = sqrt(max(
+        0.0, innovation.dot(
+            variances.cwiseInverse().asDiagonal() * innovation)));
+    const bool innovation_valid =
+        innovation.allFinite() && std::isfinite(innovation_norm) &&
+        std::isfinite(mahalanobis) &&
+        innovation_norm <= gnss_pvt_loop_max_innovation &&
+        mahalanobis <= gnss_pvt_loop_max_mahalanobis;
+
+    if(pvt_innovation_quarantined)
+    {
+      if(innovation_valid)
+        ++pvt_innovation_consecutive_accepts;
+      else
+        pvt_innovation_consecutive_accepts = 0;
+
+      ROS_WARN_THROTTLE(
+          1.0,
+          "PVT loop quarantined: innovation=%.3f/%.3f m "
+          "mahalanobis=%.3f/%.3f recovery=%d/%d",
+          innovation_norm, gnss_pvt_loop_max_innovation,
+          mahalanobis, gnss_pvt_loop_max_mahalanobis,
+          pvt_innovation_consecutive_accepts,
+          gnss_pvt_loop_recovery_accept_count);
+      if(pvt_innovation_consecutive_accepts >=
+         gnss_pvt_loop_recovery_accept_count)
+      {
+        pvt_innovation_quarantined = false;
+        pvt_innovation_consecutive_accepts = 0;
+        pvt_innovation_consecutive_rejects = 0;
+        have_last_pvt_loop_position = false;
+        last_pvt_loop_position.setZero();
+        ROS_WARN(
+            "PVT loop quarantine released after %d consecutive consistent "
+            "measurements; factors resume from the next measurement.",
+            gnss_pvt_loop_recovery_accept_count);
+      }
+      // The samples used to prove recovery are deliberately not added to the
+      // graph.  This prevents one transition sample from moving the map.
+      return false;
+    }
+
+    if(innovation_valid)
+    {
+      pvt_innovation_consecutive_rejects = 0;
+      return true;
+    }
+
+    ++pvt_innovation_consecutive_rejects;
+    ROS_ERROR(
+        "Reject PVT loop innovation: session=%d pose=%d norm=%.3f/%.3f m "
+        "mahalanobis=%.3f/%.3f consecutive=%d/%d",
+        sample.session_id, sample.pose_id,
+        innovation_norm, gnss_pvt_loop_max_innovation,
+        mahalanobis, gnss_pvt_loop_max_mahalanobis,
+        pvt_innovation_consecutive_rejects,
+        gnss_pvt_loop_quarantine_reject_count);
+
+    if(pvt_innovation_consecutive_rejects >=
+       gnss_pvt_loop_quarantine_reject_count)
+    {
+      pvt_innovation_quarantined = true;
+      pvt_innovation_consecutive_accepts = 0;
+      const double rollback_begin =
+          sample.timestamp - gnss_pvt_loop_rollback_seconds;
+      const size_t old_size = accepted_pvt_loop_constraints.size();
+      accepted_pvt_loop_constraints.erase(
+          std::remove_if(
+              accepted_pvt_loop_constraints.begin(),
+              accepted_pvt_loop_constraints.end(),
+              [rollback_begin](const LoopPvtConstraint &constraint)
+              {
+                return constraint.timestamp >= rollback_begin;
+              }),
+          accepted_pvt_loop_constraints.end());
+      const size_t removed =
+          old_size - accepted_pvt_loop_constraints.size();
+      have_last_pvt_loop_position =
+          !accepted_pvt_loop_constraints.empty();
+      if(have_last_pvt_loop_position)
+        last_pvt_loop_position =
+            accepted_pvt_loop_constraints.back().position;
+      else
+        last_pvt_loop_position.setZero();
+      pvt_graph_rebuild_required = true;
+      ROS_ERROR(
+          "PVT loop entered quarantine; removed %zu constraints from the "
+          "last %.1f s and requested pose-graph rebuild.",
+          removed, gnss_pvt_loop_rollback_seconds);
+    }
+    return false;
   }
 
   bool add_aligned_pvt_factor(
@@ -3322,6 +4203,45 @@ public:
     if(!pvt_alignment_ready ||
        sample.time_error > gnss_pvt_loop_time_tolerance)
       return false;
+    if(gnss_pvt_require_raw_observations && !sample.raw_gate_ready)
+    {
+      ROS_WARN_THROTTLE(
+          1.0, "Aligned PVT factor rejected by raw-observation gate: "
+          "raw=%d required=%d dt=%.3f/max=%.3f",
+          sample.raw_observations,
+          p_gnss ? static_cast<int>(p_gnss->min_obs) : max(gnss_min_obs, 4),
+          sample.raw_time_error, gnss_pvt_raw_time_tolerance);
+      return false;
+    }
+    if(gnss_pvt_pearson_enable && sample.lidar_degenerate &&
+       pvt_pearson_available &&
+       (!std::isfinite(pvt_pearson_last_healthy_time) ||
+        sample.timestamp - pvt_pearson_last_healthy_time >
+            gnss_pvt_pearson_degenerate_hold_time))
+    {
+      pvt_pearson_available = false;
+      ROS_WARN(
+          "PVT Pearson trust expired in lidar-degenerate segment: "
+          "age=%.3f/%.3f s.",
+          sample.timestamp - pvt_pearson_last_healthy_time,
+          gnss_pvt_pearson_degenerate_hold_time);
+    }
+    const bool pearson_holds_current_sample =
+        gnss_pvt_pearson_enable &&
+        (!pvt_pearson_available ||
+         (!sample.lidar_degenerate && !pvt_pearson_latest_accepted));
+    if(pearson_holds_current_sample)
+    {
+      ROS_WARN_THROTTLE(
+          1.0, "Aligned PVT factor held by Pearson gate: "
+          "score=%.3f/%.3f increment_rmse=%.3f/%.3f max=%.3f/%.3f "
+          "samples=%zu.",
+          pvt_pearson_score, gnss_pvt_pearson_threshold,
+          pvt_increment_rmse, gnss_pvt_increment_rmse_threshold,
+          pvt_increment_max, gnss_pvt_increment_max_error,
+          pvt_pearson_samples.size());
+      return false;
+    }
 
     const Eigen::Vector3d antenna_local =
         pvt_R_enu_local.transpose() *
@@ -3357,31 +4277,38 @@ public:
     constraint.variances =
         covariance_local.diagonal().cwiseMax(
             Eigen::Vector3d::Constant(0.0025));
+    double innovation_norm = std::numeric_limits<double>::infinity();
+    double whitened_residual = std::numeric_limits<double>::infinity();
+    if(!pvt_innovation_gate(
+           sample, body_local, constraint.variances,
+           innovation_norm, whitened_residual))
+      return false;
+
     const gtsam::SharedNoiseModel noise =
         create_pvt_factor_noise(constraint.variances);
     const gtsam::Key key =
         stepsizes[session_index] + sample.pose_id;
     graph.add(gtsam::GPSFactor(
         key, gtsam::Point3(constraint.position), noise));
+    geometry_msgs::Point factor_point;
+    factor_point.x = constraint.position.x();
+    factor_point.y = constraint.position.y();
+    factor_point.z = constraint.position.z();
+    pub_gnss_pvt_factor.publish(factor_point);
     accepted_pvt_loop_constraints.push_back(constraint);
     last_pvt_loop_position = body_local;
     have_last_pvt_loop_position = true;
-    const Eigen::Vector3d initial_residual =
-        sample.lidar_position - body_local;
-    const double whitened_residual = sqrt(max(
-        0.0, initial_residual.dot(
-            constraint.variances.cwiseInverse()
-                .asDiagonal() * initial_residual)));
     const double robust_weight =
         !gnss_pvt_robust_kernel_enable ||
         whitened_residual <= gnss_pvt_huber_threshold ?
         1.0 : gnss_pvt_huber_threshold / whitened_residual;
     ROS_INFO(
         "Aligned PVT factor added: session=%d pose=%d dt=%.3f "
-        "p=[%.3f %.3f %.3f] whitened_residual=%.3f "
+        "p=[%.3f %.3f %.3f] innovation=%.3f m "
+        "whitened_residual=%.3f "
         "huber_weight=%.3f",
         constraint.session_id, constraint.pose_id, sample.time_error,
-        body_local.x(), body_local.y(), body_local.z(),
+        body_local.x(), body_local.y(), body_local.z(), innovation_norm,
         whitened_residual, robust_weight);
     return true;
   }
@@ -3403,46 +4330,18 @@ public:
         gaussian);
   }
 
-  void publish_aligned_pvt_local_path()
-  {
-    if(!pvt_alignment_ready || pvt_alignment_samples.empty())
-      return;
-
-    gnss_pvt_local_path.clear();
-    gnss_pvt_local_path.reserve(pvt_alignment_samples.size());
-    for(const PvtAlignmentSample &sample : pvt_alignment_samples)
-    {
-      // PVT measures the antenna phase-center position. Keep the lever arm
-      // in the factor conversion only; this topic visualizes the raw PVT
-      // trajectory expressed in the LIO local/world coordinate system.
-      const Eigen::Vector3d antenna_local =
-          pvt_R_enu_local.transpose() *
-          (sample.pvt_enu - pvt_t_enu_local);
-      if(!antenna_local.allFinite())
-        continue;
-
-      PointType point;
-      point.x = antenna_local.x();
-      point.y = antenna_local.y();
-      point.z = antenna_local.z();
-      point.intensity = 0.0;
-      point.curvature = sample.timestamp;
-      gnss_pvt_local_path.push_back(point);
-    }
-    pub_pl_func(gnss_pvt_local_path, pub_gnss_pvt_local);
-  }
-
   int collect_and_process_pvt_for_loop_pose(
       const IMUST &pose, int session_id, int pose_id,
       const vector<int> &ids, const vector<int> &stepsizes,
       gtsam::NonlinearFactorGraph &graph, bool &alignment_just_finished,
-      bool add_pvt_factors)
+      bool add_pvt_factors, bool lidar_degenerate)
   {
     alignment_just_finished = false;
     PvtAlignmentSample current_pose;
     current_pose.timestamp = pose.t;
     current_pose.lidar_position = pose.p;
     current_pose.lidar_rotation = pose.R;
+    current_pose.lidar_degenerate = lidar_degenerate;
     current_pose.session_id = session_id;
     current_pose.pose_id = pose_id;
 
@@ -3481,10 +4380,17 @@ public:
     {
       const bool appended =
           append_pvt_alignment_sample(match.first, match.second);
-      if(appended && pvt_alignment_ready && add_pvt_factors &&
-         add_aligned_pvt_factor(
-             pvt_alignment_samples.back(), ids, stepsizes, graph))
-        ++added_factors;
+      if(appended && pvt_alignment_ready)
+      {
+        const bool new_pose = append_pvt_pearson_sample(
+            pvt_alignment_samples.back());
+        if(new_pose)
+          evaluate_pvt_relative_pearson();
+        if(add_pvt_factors &&
+           add_aligned_pvt_factor(
+               pvt_alignment_samples.back(), ids, stepsizes, graph))
+          ++added_factors;
+      }
     }
 
     if(!pvt_alignment_ready && optimize_pvt_alignment())
@@ -3492,7 +4398,11 @@ public:
       alignment_just_finished = true;
       have_last_pvt_loop_position = false;
       last_pvt_loop_position.setZero();
-      if(add_pvt_factors)
+      reset_pvt_pearson_gate("PVT alignment initialized");
+      for(const PvtAlignmentSample &sample : pvt_alignment_samples)
+        append_pvt_pearson_sample(sample);
+      evaluate_pvt_relative_pearson();
+      if(add_pvt_factors && pvt_pearson_available)
       {
         for(const PvtAlignmentSample &sample : pvt_alignment_samples)
         {
@@ -3506,9 +4416,6 @@ public:
           gnss_pvt_loop_time_tolerance,
           gnss_pvt_loop_min_distance, added_factors);
     }
-    if(pvt_alignment_ready &&
-       (!matches.empty() || alignment_just_finished))
-      publish_aligned_pvt_local_path();
     return added_factors;
   }
 
@@ -3555,6 +4462,31 @@ public:
     }
   }
 
+  gtsam::Vector pose_graph_odom_variances(
+      const ScanPose &from, const ScanPose &to) const
+  {
+    gtsam::Vector variances(6);
+    if(!from.hba_eligible || !to.hba_eligible)
+    {
+      const double rotation_variance =
+          gnss_degenerate_odom_rotation_std *
+          gnss_degenerate_odom_rotation_std;
+      const double translation_variance =
+          gnss_degenerate_odom_translation_std *
+          gnss_degenerate_odom_translation_std;
+      variances << rotation_variance, rotation_variance, rotation_variance,
+                   translation_variance, translation_variance,
+                   translation_variance;
+      return variances;
+    }
+
+    variances = gtsam::Vector(from.v6);
+    for(int i = 0; i < 6; ++i)
+      if(!std::isfinite(variances[i]) || variances[i] <= 0.0)
+        variances[i] = 1e-3;
+    return variances;
+  }
+
   // Build the pose graph in loop closure
   void build_graph(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph, int cur_id, PGO_Edges &lp_edges, gtsam::noiseModel::Diagonal::shared_ptr default_noise, vector<int> &ids, vector<int> &stepsizes, int lpedge_enable)
   {
@@ -3576,10 +4508,14 @@ public:
         initial.insert(j, pose3);
         if(j > bsize)
         {
-          gtsam::Vector samv6(6);
-          samv6 = multimap_scanPoses[ids[ii]]->at(j-1-bsize)->v6;
+          ScanPose &previous =
+              *multimap_scanPoses[ids[ii]]->at(j - 1 - bsize);
+          ScanPose &current =
+              *multimap_scanPoses[id]->at(j - bsize);
+          const gtsam::Vector samv6 =
+              pose_graph_odom_variances(previous, current);
           gtsam::noiseModel::Diagonal::shared_ptr v6_noise = gtsam::noiseModel::Diagonal::Variances(samv6);
-          add_edge(j-1, j, multimap_scanPoses[id]->at(j-1-bsize)->x, multimap_scanPoses[id]->at(j-bsize)->x, graph, v6_noise);
+          add_edge(j-1, j, previous.odom_x, current.odom_x, graph, v6_noise);
           // add_edge(j-1, j, multimap_scanPoses[id]->at(j-1-bsize)->x, multimap_scanPoses[id]->at(j-bsize)->x, graph, default_noise);
         }
       }
@@ -3616,8 +4552,241 @@ public:
         }
       }
     }
+    for(PGO_Edge &edge : committed_hba_edges.edges)
+    {
+      vector<int> step(2);
+      if(!edge.is_adapt(ids, step))
+        continue;
+      int base[2] = {stepsizes[step[0]], stepsizes[step[1]]};
+      for(size_t i = 0; i < edge.rots.size(); ++i)
+      {
+        const int id1 = base[0] + edge.ids1[i];
+        const int id2 = base[1] + edge.ids2[i];
+        const auto noise = gtsam::noiseModel::Diagonal::Variances(
+            gtsam::Vector(edge.covs[i]));
+        add_edge(id1, id2, edge.rots[i], edge.tras[i], graph, noise);
+      }
+    }
     add_persisted_pvt_factors(ids, stepsizes, graph);
-    
+
+  }
+
+  // Publish a backend correction to the frontend only through loop_update().
+  // This keeps the live sliding window, its voxel map, and the keyframe map in
+  // one coordinate frame even when the correction originates from PVT-HBA.
+  void queue_live_map_update(int cur_id, bool rotate_gravity,
+                             const char *source)
+  {
+    const Eigen::Vector3d correction_angle = Log(dx.R);
+    ROS_INFO(
+        "Backend correction queued: source=%s translation=%.3f m "
+        "rotation=%.3f deg.",
+        source, dx.p.norm(),
+        correction_angle.norm() * 57.29577951308232);
+    unique_lock<mutex> history_lock(mtx_history_map, defer_lock);
+    unique_lock<mutex> keyframe_lock(mtx_keyframe, defer_lock);
+    lock(history_lock, keyframe_lock);
+    lock_guard<mutex> map_lock(mtx_map_handoff);
+
+    vector<OctoTree*> stale_octrees;
+    for(auto &entry : map_loop)
+    {
+      if(entry.second == nullptr)
+        continue;
+      entry.second->tras_ptr(stale_octrees);
+      delete entry.second;
+    }
+    for(OctoTree *octree : stale_octrees)
+      delete octree;
+    map_loop.clear();
+
+    history_kfsize = 0;
+    PVec pvec_tem;
+    const int subsize = keyframes->size();
+    const int init_num = 5;
+    for(int i = subsize - init_num; i < subsize; ++i)
+    {
+      if(i < 0)
+        continue;
+      Keyframe &sp = *(keyframes->at(i));
+      sp.exist = 0;
+      pvec_tem.clear();
+      pvec_tem.reserve(sp.plptr->size());
+      pointVar pv;
+      pv.var.setZero();
+      for(PointType &ap : sp.plptr->points)
+      {
+        pv.pnt << ap.x, ap.y, ap.z;
+        pv.pnt = sp.x0.R * pv.pnt + sp.x0.p;
+        for(int j = 0; j < 3; ++j)
+          pv.var(j, j) = ap.normal[j];
+        pvec_tem.push_back(pv);
+      }
+      cut_voxel(map_loop, pvec_tem, win_size, 0);
+    }
+
+    if(subsize > init_num)
+    {
+      pl_kdmap->clear();
+      for(int i = 0; i < subsize - init_num; ++i)
+      {
+        Keyframe &kf = *(keyframes->at(i));
+        kf.exist = 1;
+        PointType pp{};
+        pp.x = kf.x0.p[0]; pp.y = kf.x0.p[1]; pp.z = kf.x0.p[2];
+        pp.intensity = cur_id; pp.curvature = i;
+        pl_kdmap->push_back(pp);
+      }
+      if(!pl_kdmap->empty())
+      {
+        kd_keyframes.setInputCloud(pl_kdmap);
+        history_kfsize = pl_kdmap->size();
+      }
+      else
+      {
+        history_kfsize = 0;
+        ROS_WARN("Skipped history KD-tree update: keyframe cloud is empty.");
+      }
+    }
+
+    if(rotate_gravity)
+      rotate_gravity_on_map_update.store(true, std::memory_order_release);
+    if(map_loop.empty())
+    {
+      ROS_ERROR(
+          "Backend correction not queued: rebuilt map is empty (source=%s).",
+          source);
+      return;
+    }
+    // Store the correction and rebuilt map as one handoff transaction.  The
+    // frontend snapshots pending_map_dx while holding mtx_map_handoff.
+    pending_map_dx = dx;
+    const auto sync_pvt_pose = [&](PvtAlignmentSample &sample) {
+      if(sample.session_id >= 0 &&
+         sample.session_id < static_cast<int>(multimap_scanPoses.size()) &&
+         multimap_scanPoses[sample.session_id] != nullptr &&
+         sample.pose_id >= 0 &&
+         sample.pose_id < static_cast<int>(
+             multimap_scanPoses[sample.session_id]->size()))
+      {
+        const IMUST &optimized =
+            multimap_scanPoses[sample.session_id]->at(sample.pose_id)->x;
+        sample.lidar_position = optimized.p;
+        sample.lidar_rotation = optimized.R;
+      }
+      else
+      {
+        sample.lidar_position = dx.R * sample.lidar_position + dx.p;
+        sample.lidar_rotation = dx.R * sample.lidar_rotation;
+      }
+    };
+    for(PvtAlignmentSample &sample : pvt_pearson_samples)
+      sync_pvt_pose(sample);
+    if(have_previous_pvt_loop_pose)
+      sync_pvt_pose(previous_pvt_loop_pose);
+    for(ScanPose *pose : *scanPoses)
+      if(pose != nullptr)
+        pose->update_odom_frame(dx);
+    loop_detect.store(1, std::memory_order_release);
+  }
+
+  bool optimize_degenerate_pvt_graph(
+      gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph,
+      const vector<int> &ids, const vector<int> &stepsizes,
+      int cur_id, int current_pose_id, IMUST &x_key)
+  {
+    if(current_pose_id < 0 || scanPoses->empty() || initial.empty())
+      return false;
+
+    gtsam::ISAM2Params parameters;
+    parameters.relinearizeThreshold = 0.01;
+    parameters.relinearizeSkip = 1;
+    gtsam::ISAM2 isam(parameters);
+    isam.update(graph, initial);
+    for(int i = 0; i < 5; ++i)
+      isam.update();
+    const gtsam::Values results = isam.calculateEstimate();
+    if(results.empty())
+      return false;
+
+    const IMUST pose_before = scanPoses->at(current_pose_id)->x;
+    for(size_t session_index = 0; session_index < ids.size();
+        ++session_index)
+    {
+      const int session_id = ids[session_index];
+      for(int graph_id = stepsizes[session_index];
+          graph_id < stepsizes[session_index + 1]; ++graph_id)
+      {
+        const int pose_id = graph_id - stepsizes[session_index];
+        multimap_scanPoses[session_id]->at(pose_id)->set_state(
+            results.at(graph_id).cast<gtsam::Pose3>());
+      }
+    }
+
+    {
+      lock_guard<mutex> keyframe_lock(mtx_keyframe);
+      for(size_t session_index = 0; session_index < ids.size();
+          ++session_index)
+      {
+        const int session_id = ids[session_index];
+        for(Keyframe *keyframe : *multimap_keyframes[session_id])
+          keyframe->x0 =
+              multimap_scanPoses[session_id]->at(keyframe->id)->x;
+      }
+    }
+
+    initial.clear();
+    for(size_t graph_id = 0; graph_id < results.size(); ++graph_id)
+      initial.insert(
+          graph_id, results.at(graph_id).cast<gtsam::Pose3>());
+
+    const IMUST pose_after = scanPoses->at(current_pose_id)->x;
+    dx.R = pose_after.R * pose_before.R.transpose();
+    dx.p = pose_after.p - dx.R * pose_before.p;
+    x_key = pose_after;
+    queue_live_map_update(cur_id, true, "PVT-degenerate-PGO");
+    ROS_WARN(
+        "Optimized lidar-degenerate pose chain with RTK factors: "
+        "current_pose=%d graph_poses=%zu correction=%.3f m.",
+        current_pose_id, results.size(), dx.p.norm());
+    return true;
+  }
+
+  void reset_pvt_backend_state()
+  {
+    {
+      lock_guard<mutex> lock(mtx_pvt_loop);
+      raw_pvt_loop_measurements.clear();
+    }
+    pvt_alignment_samples.clear();
+    pvt_pearson_samples.clear();
+    pvt_pearson_available = !gnss_pvt_pearson_enable;
+    pvt_pearson_latest_accepted = !gnss_pvt_pearson_enable;
+    pvt_pearson_consecutive_accepts = 0;
+    pvt_pearson_consecutive_rejects = 0;
+    pvt_pearson_score = -std::numeric_limits<double>::infinity();
+    pvt_increment_rmse = std::numeric_limits<double>::infinity();
+    pvt_increment_max = std::numeric_limits<double>::infinity();
+    pvt_pearson_last_healthy_time =
+        -std::numeric_limits<double>::infinity();
+    pvt_innovation_quarantined = false;
+    pvt_innovation_consecutive_rejects = 0;
+    pvt_innovation_consecutive_accepts = 0;
+    pvt_graph_rebuild_required = false;
+    have_last_pvt_loop_position = false;
+    last_pvt_loop_position.setZero();
+    pvt_alignment_initialized = false;
+    pvt_alignment_ready = false;
+    have_previous_pvt_loop_pose = false;
+    pvt_alignment_origin_ecef.setZero();
+    pvt_R_ecef_enu.setIdentity();
+    pvt_R_enu_local.setIdentity();
+    pvt_R_enu_local_prior.setIdentity();
+    pvt_t_enu_local.setZero();
+    pvt_t_enu_local_prior.setZero();
+    pvt_Tex_imu_r.setZero();
+    pvt_Tex_imu_r_prior.setZero();
+    ROS_INFO("PVT backend alignment and Pearson state reset in loop thread.");
   }
 
   // The main thread of loop clousre
@@ -3671,12 +4840,17 @@ public:
     int buf_base = 0;
     int pending_pvt_factor_count = 0;
     bool force_pvt_optimization = false;
+    int hba_segment = 0;
+    bool hba_gap_open = false;
 
     while(n.ok())
     {
-      if(reset_flag == 1)
+      if(pvt_backend_reset_requested.exchange(
+             false, std::memory_order_acq_rel))
+        reset_pvt_backend_state();
+
+      if(reset_flag.exchange(0, std::memory_order_acq_rel) == 1)
       {
-        reset_flag = 0;
         scanPoses->insert(scanPoses->end(), buf_lba2loop_tem.begin(), buf_lba2loop_tem.end());
         for(ScanPose *bl: buf_lba2loop_tem) bl->pvec = nullptr;
         buf_lba2loop_tem.clear();
@@ -3686,7 +4860,9 @@ public:
         scanPoses = new vector<ScanPose*>();
         multimap_scanPoses.push_back(scanPoses);
 
-        bl_local.clear(); buf_base = 0; 
+        bl_local.clear(); buf_base = 0;
+        hba_segment = 0;
+        hba_gap_open = false;
         std_manager->config_setting_.skip_near_num_ = -(std_manager->plane_cloud_vec_.size()+10);
         std_manager = new STDescManager(config_setting);
         std_managers.push_back(std_manager);
@@ -3734,7 +4910,10 @@ public:
 
       int cur_id = std_managers.size() - 1;
       scanPoses->push_back(bl_head);
-      bl_local.push_back(bl_head);
+      const bool hba_candidate =
+          bl_head->hba_eligible && static_cast<bool>(bl_head->pvec);
+      if(hba_candidate)
+        bl_local.push_back(bl_head);
       IMUST xc = bl_head->x;
       gtsam::Pose3 pose3(gtsam::Rot3(xc.R), gtsam::Point3(xc.p));
       int g_pos = stepsizes.back();
@@ -3742,9 +4921,13 @@ public:
 
       if(g_pos > 0)
       {
-        gtsam::Vector samv6(scanPoses->at(buf_base-1)->v6);
+        const gtsam::Vector samv6 = pose_graph_odom_variances(
+            *scanPoses->at(buf_base - 1), *bl_head);
         gtsam::noiseModel::Diagonal::shared_ptr v6_noise = gtsam::noiseModel::Diagonal::Variances(samv6);
-        add_edge(g_pos-1, g_pos, scanPoses->at(buf_base-1)->x, xc, graph, v6_noise);
+        add_edge(
+            g_pos - 1, g_pos,
+            scanPoses->at(buf_base - 1)->odom_x, bl_head->odom_x,
+            graph, v6_noise);
       }
       else
       {
@@ -3759,12 +4942,73 @@ public:
             collect_and_process_pvt_for_loop_pose(
                 xc, cur_id, buf_base - 1, ids, stepsizes,
                 graph, alignment_just_finished,
-                gnss_pvt_loop_enable);
+                gnss_pvt_loop_enable,
+                !bl_head->hba_eligible);
         pending_pvt_factor_count += added_pvt_factors;
         force_pvt_optimization =
             force_pvt_optimization ||
             (alignment_just_finished && added_pvt_factors > 0);
+        if(pvt_graph_rebuild_required)
+        {
+          // graph still owns factors added before quarantine.  Reconstruct it
+          // from odometry/loop edges and the surviving PVT constraints so the
+          // rejected bridge segment cannot keep pulling future estimates.
+          build_graph(
+              initial, graph, cur_id, lp_edges, odom_noise,
+              ids, stepsizes, 1);
+          pvt_graph_rebuild_required = false;
+          pending_pvt_factor_count = 0;
+          force_pvt_optimization = true;
+          ROS_WARN(
+              "Pose graph rebuilt after PVT quarantine; optimization queued "
+              "without the rolled-back absolute factors.");
+        }
       }
+
+      if(!hba_candidate)
+      {
+        // Never bridge an HBA/BTC aggregate across a degraded interval.
+        // The pose remains in scanPoses/PGO, but no null or degraded cloud
+        // reaches point-cloud aggregation.
+        for(ScanPose *pose : bl_local)
+          if(pose != nullptr)
+            pose->pvec = nullptr;
+        bl_local.clear();
+        if(!hba_gap_open)
+        {
+          ++hba_segment;
+          hba_gap_open = true;
+        }
+        const bool trigger_degenerate_pvt_optimization =
+            force_pvt_optimization ||
+            pending_pvt_factor_count >= gnss_pvt_loop_trigger_count;
+        bool have_map_seed = false;
+        {
+          lock_guard<mutex> keyframe_lock(mtx_keyframe);
+          have_map_seed = !keyframes->empty();
+        }
+        if(trigger_degenerate_pvt_optimization && have_map_seed)
+        {
+          ROS_INFO(
+              "Trigger RTK-aided PGO in lidar-degenerate segment with "
+              "%d new PVT factors.",
+              pending_pvt_factor_count);
+          pending_pvt_factor_count = 0;
+          force_pvt_optimization = false;
+          optimize_degenerate_pvt_graph(
+              initial, graph, ids, stepsizes, cur_id,
+              buf_base - 1, x_key);
+        }
+        else if(trigger_degenerate_pvt_optimization)
+        {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "Defer RTK-aided degenerate PGO until one healthy map "
+              "keyframe is available.");
+        }
+        continue;
+      }
+      hba_gap_open = false;
 
       if(bl_local.size() < win_size) continue;
       double ang = Log(x_key.R.transpose() * xc.R).norm() * 57.3;
@@ -3799,6 +5043,7 @@ public:
 
       Keyframe *smp = new Keyframe(xc);
       smp->id = buf_base - 1;
+      smp->hba_segment = hba_segment;
       smp->jour = jours[cur_id];
       down_sampling_pvec(*pptr, voxel_size/10, *(smp->plptr));
 
@@ -3981,59 +5226,54 @@ public:
         for(int i=0; i<resultsize; i++)
           initial.insert(i, results.at(i).cast<gtsam::Pose3>());
         
-        IMUST x3 = scanPoses->at(buf_base-1)->x;
-        dx.p = x3.p - x3.R * x1.R.transpose() * x1.p;
-        dx.R = x3.R * x1.R.transpose();
-        x_key = x3;
+        const bool update_live_local_map =
+            geometric_loop_optimization || pvt_requested_optimization;
 
-        if(geometric_loop_optimization)
+        // HBA used to run only during shutdown.  A PVT-only PGO changes the
+        // global datum while the historical keyframe clouds remain locally
+        // rigid, which is exactly the case where a delayed HBA is useful.
+        // Do not run it for geometric loops (their regular HBA path remains
+        // unchanged), and require a complete HBA window so the loop thread
+        // cannot wait forever for keyframes it is itself responsible for.
+        const double now = ros::Time::now().toSec();
+        size_t current_keyframe_count = 0;
         {
-          history_kfsize = 0;
-          PVec pvec_tem;
-          int subsize = keyframes->size();
-          int init_num = 5;
-          for(int i=subsize-init_num; i<subsize; i++)
-          {
-            if(i < 0) continue;
-            Keyframe &sp = *(keyframes->at(i));
-            sp.exist = 0;
-            pvec_tem.clear();
-            pvec_tem.reserve(sp.plptr->size());
-            pointVar pv; pv.var.setZero();
-            for(PointType &ap: sp.plptr->points)
-            {
-              pv.pnt << ap.x, ap.y, ap.z;
-              pv.pnt = sp.x0.R * pv.pnt + sp.x0.p;
-              for(int j=0; j<3; j++)
-                pv.var(j, j) = ap.normal[j];
-              pvec_tem.push_back(pv);
-            }
-            cut_voxel(map_loop, pvec_tem, win_size, 0);
-          }
-
-          if(subsize > init_num)
-          {
-            pl_kdmap->clear();
-            for(int i=0; i<subsize-init_num; i++)
-            {
-              Keyframe &kf = *(keyframes->at(i));
-              kf.exist = 1;
-              PointType pp;
-              pp.x = kf.x0.p[0]; pp.y = kf.x0.p[1]; pp.z = kf.x0.p[2];
-              pp.intensity = cur_id; pp.curvature = i;
-              pl_kdmap->push_back(pp);
-            }
-
-            kd_keyframes.setInputCloud(pl_kdmap);
-            history_kfsize = pl_kdmap->size();
-          }
-          loop_detect.store(1, std::memory_order_release);
+          lock_guard<mutex> keyframe_lock(mtx_keyframe);
+          current_keyframe_count = keyframes->size();
         }
-        else if(pvt_requested_optimization)
+        const bool run_pvt_hba =
+            pvt_requested_optimization && !geometric_loop_optimization &&
+            gnss_pvt_hba_enable && !pvt_innovation_quarantined &&
+            current_keyframe_count >=
+                static_cast<size_t>(gnss_pvt_hba_min_keyframes) &&
+            gba_flag.load(std::memory_order_acquire) == 0 &&
+            now - last_gnss_pvt_hba_time >= gnss_pvt_hba_min_interval;
+        if(run_pvt_hba)
         {
           ROS_INFO(
-              "PVT-only pose graph optimization completed; skipped local "
-              "voxel-map replacement (no geometric loop constraint).");
+              "Start PVT-triggered HBA: keyframes=%zu, min_interval=%.1f s.",
+              current_keyframe_count, gnss_pvt_hba_min_interval);
+          topDownProcess(initial, graph, ids, stepsizes, false);
+          last_gnss_pvt_hba_time = now;
+          ROS_INFO("PVT-triggered HBA completed.");
+        }
+
+        if(update_live_local_map)
+        {
+          // PGO and optional HBA are one transaction.  Compute the total
+          // pre-PGO -> final transform and publish exactly one map handoff.
+          const IMUST x_final = scanPoses->at(buf_base - 1)->x;
+          dx.R = x_final.R * x1.R.transpose();
+          dx.p = x_final.p - dx.R * x1.p;
+          x_key = x_final;
+          queue_live_map_update(
+              cur_id,
+              run_pvt_hba ||
+                  (pvt_requested_optimization &&
+                   !geometric_loop_optimization),
+              run_pvt_hba ? "PVT-PGO+HBA" :
+                  (geometric_loop_optimization ?
+                       "geometric-loop" : "PVT-only"));
         }
 
         vector<int> ids2 = ids; ids2.pop_back();
@@ -4097,21 +5337,27 @@ public:
   }
 
   // The top down process of HBA
-  void topDownProcess(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph, vector<int> &ids, vector<int> &stepsizes)
+  void topDownProcess(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph,
+                      vector<int> &ids, vector<int> &stepsizes,
+                      bool clear_visualization = true)
   {
     cnct_map = ids;
     gba_size = multimap_keyframes.back()->size();
-    gba_flag = 1;
+    gba_flag.store(1, std::memory_order_release);
 
-    pcl::PointCloud<PointType> pl0;
-    pub_pl_func(pl0, pub_pmap);
-    pub_pl_func(pl0, pub_cmap);
-    pub_pl_func(pl0, pub_curr_path);
-    pub_pl_func(pl0, pub_prev_path);
-    pub_pl_func(pl0, pub_scan);
+    if(clear_visualization)
+    {
+      pcl::PointCloud<PointType> pl0;
+      pub_pl_func(pl0, pub_pmap);
+      pub_pl_func(pl0, pub_cmap);
+      pub_pl_func(pl0, pub_curr_path);
+      pub_pl_func(pl0, pub_prev_path);
+      pub_pl_func(pl0, pub_scan);
+    }
 
     double t0 = ros::Time::now().toSec();
-    while(gba_flag);
+    while(gba_flag.load(std::memory_order_acquire) == 1 && ros::ok())
+      sleep(0.01);
     
     for(PGO_Edge &edge: gba_edges1.edges)
     {
@@ -4125,6 +5371,9 @@ public:
           int id2 = mp[1] + edge.ids2[i];
           gtsam::noiseModel::Diagonal::shared_ptr v6_noise = gtsam::noiseModel::Diagonal::Variances(gtsam::Vector(edge.covs[i]));
           add_edge(id1, id2, edge.rots[i], edge.tras[i], graph, v6_noise);
+          committed_hba_edges.push(
+              edge.m1, edge.m2, edge.ids1[i], edge.ids2[i],
+              edge.rots[i], edge.tras[i], edge.covs[i]);
         }
       }
     }
@@ -4141,9 +5390,16 @@ public:
           int id2 = mp[1] + edge.ids2[i];
           gtsam::noiseModel::Diagonal::shared_ptr v6_noise = gtsam::noiseModel::Diagonal::Variances(gtsam::Vector(edge.covs[i]));
           add_edge(id1, id2, edge.rots[i], edge.tras[i], graph, v6_noise);
+          committed_hba_edges.push(
+              edge.m1, edge.m2, edge.ids1[i], edge.ids2[i],
+              edge.rots[i], edge.tras[i], edge.covs[i]);
         }
       }
     }
+    // The constraints are now owned by graph.  Keeping them in the staging
+    // buffers would append the same HBA factors again on the next PVT-HBA.
+    gba_edges1.edges.clear(); gba_edges1.mates.clear();
+    gba_edges2.edges.clear(); gba_edges2.mates.clear();
 
     gtsam::ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -4166,16 +5422,25 @@ public:
       }
     }
 
+    // topDownProcess can now run online after a PVT correction.  Preserve the
+    // HBA-refined state as the initial estimate for the next incremental PGO.
+    initial.clear();
+    for(int i=0; i<resultsize; ++i)
+      initial.insert(i, results.at(i).cast<gtsam::Pose3>());
+
     Eigen::Quaterniond qq(multimap_scanPoses[0]->at(0)->x.R);
 
     double t1 = ros::Time::now().toSec();
     printf("GBA opt: %lfs\n", t1 - t0);
 
-    for(int ii=0; ii<idsize; ii++)
     {
-      int tip = ids[ii];
-      for(Keyframe *smp: *multimap_keyframes[tip])
-        smp->x0 = multimap_scanPoses[tip]->at(smp->id)->x;
+      lock_guard<mutex> keyframe_lock(mtx_keyframe);
+      for(int ii=0; ii<idsize; ii++)
+      {
+        int tip = ids[ii];
+        for(Keyframe *smp: *multimap_keyframes[tip])
+          smp->x0 = multimap_scanPoses[tip]->at(smp->id)->x;
+      }
     }
 
     ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
@@ -4186,8 +5451,13 @@ public:
   }
 
   // The bottom up to add edge in HBA
-  void HBA_add_edge(vector<IMUST> &p_xs, vector<Keyframe*> &p_smps, PGO_Edges &gba_edges, vector<int> &maps, int max_iter, int thread_num, pcl::PointCloud<PointType>::Ptr plptr = nullptr)
+  bool HBA_add_edge(vector<IMUST> &p_xs, vector<Keyframe*> &p_smps, PGO_Edges &gba_edges, vector<int> &maps, int max_iter, int thread_num, pcl::PointCloud<PointType>::Ptr plptr = nullptr)
   {
+    if(p_smps.empty() || p_xs.size() != p_smps.size())
+    {
+      ROS_WARN("Skip HBA window: pose/keyframe input is empty or inconsistent.");
+      return false;
+    }
     bool is_display = false;
     if(plptr == nullptr) is_display = true;
 
@@ -4198,6 +5468,12 @@ public:
     for(int i=0; i<p_smps.size(); i++)
     {
       Keyframe *smp = p_smps[i];
+      if(smp == nullptr || !smp->plptr || smp->plptr->empty())
+      {
+        ROS_WARN("Skip HBA window: keyframe %d has no valid point cloud.",
+                 smp == nullptr ? -1 : smp->id);
+        return false;
+      }
       if(smp->mp != last_mp)
       {
         isCnct = 0;
@@ -4217,10 +5493,21 @@ public:
     }
     
     int wdsize = smps.size();
+    if(wdsize < 2)
+    {
+      ROS_WARN("Skip HBA window: only %d connected keyframe(s).", wdsize);
+      return false;
+    }
     Eigen::MatrixXd hess;
     vector<double> gba_eigen_value_array_orig = gba_eigen_value_array;
     double gba_min_eigen_value_orig = gba_min_eigen_value;
     double gba_voxel_size_orig = gba_voxel_size;
+    const auto restore_gba_parameters = [&]()
+    {
+      gba_eigen_value_array = gba_eigen_value_array_orig;
+      gba_min_eigen_value = gba_min_eigen_value_orig;
+      gba_voxel_size = gba_voxel_size_orig;
+    };
 
     int up = 4;
     int converge_flag = 0;
@@ -4246,14 +5533,32 @@ public:
 
       LidarFactor voxhess(wdsize);
       OctreeGBA_multi_recut(oct_map, voxhess, thread_num);
+      if(voxhess.plvec_voxels.empty())
+      {
+        ROS_WARN("Skip HBA window: no valid shared voxel factors.");
+        restore_gba_parameters();
+        return false;
+      }
 
       Lidar_BA_Optimizer opt_lsv;
-      opt_lsv.thd_num = thread_num;
+      opt_lsv.thd_num = std::max(
+          1, std::min(thread_num,
+                      static_cast<int>(voxhess.plvec_voxels.size())));
       vector<double> resis;
       bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
+      if(resis.size() < 2 || !std::isfinite(resis[0]) ||
+         !std::isfinite(resis[1]))
+      {
+        ROS_WARN("Skip HBA window: optimizer returned invalid residuals.");
+        restore_gba_parameters();
+        return false;
+      }
+      const double residual_scale = std::max(1e-12, std::fabs(resis[0]));
+      const double relative_change =
+          std::fabs(resis[0] - resis[1]) / residual_scale;
       if(is_display)
-        printf("%lf\n", fabs(resis[0] - resis[1]) / resis[0]);
-      if((fabs(resis[0] - resis[1]) / resis[0] < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
+        printf("%lf\n", relative_change);
+      if((relative_change < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
       {
         converge_thre = 0.01;
         if(converge_flag == 0)
@@ -4267,9 +5572,7 @@ public:
       }
     }
 
-    gba_eigen_value_array = gba_eigen_value_array_orig;
-    gba_min_eigen_value = gba_min_eigen_value_orig;
-    gba_voxel_size = gba_voxel_size_orig;
+    restore_gba_parameters();
 
     for(int i=0; i<wdsize - 1; i++)
     for(int j=i+1; j<wdsize; j++)
@@ -4348,6 +5651,8 @@ public:
       // return;
     }
 
+    return true;
+
   }
 
   // The main thread of bottom up in global mapping
@@ -4382,9 +5687,11 @@ public:
 
       vector<Keyframe*> &smps = *multimap_keyframes[smp_mp];
       int total_ba = 0;
-      if(gba_flag == 1 && smp_mp >= cnct_map.back() && gba_size <= buf_base)
+      if(gba_flag.load(std::memory_order_acquire) == 1 &&
+         smp_mp >= cnct_map.back() && gba_size <= buf_base)
       {
-        printf("gba_flag enter: %d\n", gba_flag);
+        printf("gba_flag enter: %d\n",
+               gba_flag.load(std::memory_order_relaxed));
         total_ba = 1;
       }
       else if(smps.size() <= buf_base)
@@ -4397,6 +5704,16 @@ public:
       else
       {
         smps[buf_base]->mp = smp_mp;
+        if(!localID.empty() &&
+           smps[localID.back()]->hba_segment !=
+               smps[buf_base]->hba_segment)
+        {
+          localID.clear();
+          for(Keyframe *submap : gba_submaps)
+            delete submap;
+          gba_submaps.clear();
+          ROS_INFO("Start a new HBA window after lidar-degenerate segment.");
+        }
         localID.push_back(buf_base);
 
         buf_base++;
@@ -4418,12 +5735,27 @@ public:
 
       double tg1 = ros::Time::now().toSec();
 
+      if(smp_local.empty())
+      {
+        ROS_WARN("Skip global HBA aggregation: local keyframe window is empty.");
+        if(total_ba == 1)
+          gba_flag.store(0, std::memory_order_release);
+        continue;
+      }
       Keyframe *gba_smp = new Keyframe(smp_local[0]->x0);
       vector<int> mps{smp_mp};
-      HBA_add_edge(xs, smp_local, gba_edges1, mps, 1, 2, gba_smp->plptr);
-      gba_smp->id = smp_local[0]->id;
-      gba_smp->mp = smp_mp;
-      gba_submaps.push_back(gba_smp);
+      if(HBA_add_edge(
+             xs, smp_local, gba_edges1, mps, 1, 2, gba_smp->plptr))
+      {
+        gba_smp->id = smp_local[0]->id;
+        gba_smp->mp = smp_mp;
+        gba_smp->hba_segment = smp_local[0]->hba_segment;
+        gba_submaps.push_back(gba_smp);
+      }
+      else
+      {
+        delete gba_smp;
+      }
 
       if(total_ba == 1)
       {
@@ -4436,17 +5768,19 @@ public:
         }
         mtx_keyframe.unlock();
         gba_edges2.edges.clear(); gba_edges2.mates.clear();
-        HBA_add_edge(xs, gba_submaps, gba_edges2, cnct_map, total_max_iter, thread_num);
+        if(gba_submaps.size() >= 2)
+          HBA_add_edge(
+              xs, gba_submaps, gba_edges2, cnct_map,
+              total_max_iter, thread_num);
+        else
+          ROS_WARN("Skip top-level HBA: fewer than two valid submaps.");
 
-        if(is_finish)
-        {
-          for(int i=0; i<gba_submaps.size(); i++)
-            delete gba_submaps[i];
-        }
+        for(int i=0; i<gba_submaps.size(); i++)
+          delete gba_submaps[i];
         gba_submaps.clear();
 
         malloc_trim(0);
-        gba_flag = 0;
+        gba_flag.store(0, std::memory_order_release);
       }
       else if(smp_flag == 1 && multimap_keyframes[smp_mp]->size() <= buf_base)
       {
@@ -4479,6 +5813,8 @@ int main(int argc, char **argv)
   pub_prev_path = n.advertise<sensor_msgs::PointCloud2>("/map_true", 100);
   pub_gnss_fix_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_fix_local", 100);
   pub_gnss_pvt_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_pvt_local", 100);
+  pub_gnss_pvt_factor =
+      n.advertise<geometry_msgs::Point>("/map_gnss_pvt_factor", 100);
   pub_gnss_spp_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_spp_local", 100);
   pub_gnss_tc_local = n.advertise<sensor_msgs::PointCloud2>("/map_gnss_tc_local", 100);
   pub_lio_odom_enu = n.advertise<nav_msgs::Odometry>("/lio_odom_enu", 100);

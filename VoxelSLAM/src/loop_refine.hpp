@@ -18,10 +18,20 @@ struct ScanPose
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   IMUST x;
+  // Raw odometry realization.  PGO/HBA may change x, but odom_x is only
+  // changed by a common rigid frame handoff, so relative odometry increments
+  // remain immutable when the factor graph is rebuilt.
+  IMUST odom_x;
   PVecPtr pvec;
   Eigen::Matrix<double, 6, 1> v6;
+  // Frontend frame represented by this graph node.  Graph pose ids can be
+  // sparse with respect to frontend frames when degraded poses are disabled.
+  int frame_id = -1;
+  // All poses participate in PGO.  Only poses backed by a geometrically
+  // healthy lidar window may contribute point clouds to BTC/HBA.
+  bool hba_eligible = true;
 
-  ScanPose(IMUST &_x, PVecPtr _pvec): x(_x), pvec(_pvec)
+  ScanPose(IMUST &_x, PVecPtr _pvec): x(_x), odom_x(_x), pvec(_pvec)
   {
     v6.setZero();
   }
@@ -31,6 +41,16 @@ struct ScanPose
     x.v = dx.R * x.v;
     x.p = dx.R * x.p + dx.p;
     x.R = dx.R * x.R;
+    odom_x.v = dx.R * odom_x.v;
+    odom_x.p = dx.R * odom_x.p + dx.p;
+    odom_x.R = dx.R * odom_x.R;
+  }
+
+  void update_odom_frame(const IMUST &dx)
+  {
+    odom_x.v = dx.R * odom_x.v;
+    odom_x.p = dx.R * odom_x.p + dx.p;
+    odom_x.R = dx.R * odom_x.R;
   }
 
   void set_state(const gtsam::Pose3 &pose)
