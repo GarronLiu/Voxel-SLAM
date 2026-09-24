@@ -6,7 +6,7 @@ General:
   bagname: "mid360_init"
   lidar_type: 0
   blind: 0.5 # 0.5
-  lidar_max_range: 25.0
+  lidar_max_range: 100.0
   point_filter_num: 3
   extrinsic_tran: [-0.011, -0.02329, 0.04412]
   extrinsic_rota: [1, 0, 0,
@@ -16,8 +16,8 @@ General:
 
 Odometry:
   max_init: 30
-  cov_gyr: 0.01
-  cov_acc: 1
+  cov_gyr: 0.001
+  cov_acc: 1.0
   rdw_gyr: 0.0001
   rdw_acc: 0.0001
   # down_size: 0.5
@@ -37,7 +37,7 @@ LocalBA:
   win_size: 10
   max_layer: 2
   cov_gyr: 0.01
-  cov_acc: 2
+  cov_acc: 2.0
   rdw_gyr: 0.0001
   rdw_acc: 0.0001
   min_ba_point: 1
@@ -53,7 +53,7 @@ GNSS:
   gnss_iono_params_topic: "/ublox_driver/iono_params"
   gnss_pvt_topic: "/ublox_driver/receiver_pvt"
   max_delay: 0.05 #不应该超过lidar扫描周期的一半，否则可能会匹配到错误的PVT
-  gnss_local_time_diff: 17.9
+  gnss_local_time_diff: 18.0
   pvt_hacc_thres: 1.0
   pvt_vacc_thres: 2.0
   pvt_velacc_thres: 1.0
