@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>无人艇实船操作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>无人艇实船操作台</h1><p>虚拟障碍 · Scratch / R3</p></div>
+    <div class="top-actions">
+      <span id="safetyMode" class="mode-badge safe">禁止执行器输出</span>
+      <button class="danger" data-action="e_stop">紧急停止</button>
+      <button data-action="stop_all">停止全部</button>
+    </div>
+  </header>
+
+  <nav class="view-tabs" aria-label="操作台视图">
+    <button class="view-tab active" data-view="controlView">控制台</button>
+    <button class="view-tab" data-view="visualizationView">地图可视化</button>
+  </nav>
+
+  <main id="controlView" class="app-view active">
+    <section class="status-strip" id="processStrip" aria-label="进程状态"></section>
+    <div class="workspace">
+      <section class="primary-column">
+        <div class="panel launch-panel">
+          <div class="panel-heading"><h2>启动序列</h2><button data-action="probe">检查 ROS</button></div>
+          <div class="launch-grid">
+            <article class="launch-row"><strong>1. ROS master</strong><div><button data-action="start_roscore">启动</button><button data-action="stop_roscore">停止</button></div></article>
+            <article class="launch-row"><strong>2. MAVROS</strong><div><button data-action="start_mavros">启动</button><button data-action="apply_mavlink_rates">设置频率</button><button data-action="stop_mavros">停止</button></div></article>
+            <article class="launch-row"><strong>3. UBlox GPS / RTCM</strong><div><button data-action="start_ublox_dialog">启动</button><button data-action="stop_ublox">停止</button></div></article>
+            <article class="launch-row"><strong>4. Livox</strong><div><button data-action="start_lidar_dialog">启动</button><button class="check-button" data-action="check_lidar_topic">Check topic</button><button data-action="stop_lidar">停止</button></div></article>
+            <article class="launch-row"><strong>5. 控制栈</strong><div><button class="primary" data-action="start_stack">启动</button><button data-action="stop_stack">停止</button></div></article>
+            <article class="launch-row"><strong>6. RViz</strong><div><button data-action="start_rviz">打开</button><button data-action="stop_rviz">关闭</button></div></article>
+            <article class="launch-row"><strong>7. Rosbag</strong><div><button data-action="start_rosbag">开始录制</button><button data-action="stop_rosbag">结束录制</button></div></article>
+            <article class="launch-row"><strong>8. MVS Camera</strong><div><button data-action="start_camera">启动</button><button data-action="stop_camera">停止</button></div></article>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading"><h2>模型控制</h2><span id="controllerState" class="state-label">neutral</span></div>
+          <div class="controller-grid">
+            <button class="controller selected" data-controller="neutral">Neutral</button>
+            <button class="controller" data-controller="ppo">PPO model</button>
+            <button class="controller" data-controller="apf_pid">APF / PID</button>
+            <button class="controller" data-controller="mptc">MPTC</button>
+          </div>
+          <div class="inline-actions">
+            <button data-action="clear_e_stop">解除紧急停止</button>
+            <button data-action="publish_rc_unlock">RC 解锁 index 8</button>
+            <button data-action="publish_rc_unlock_backup">备用 RC 解锁</button>
+            <button data-action="publish_rc_lock">RC 锁定</button>
+            <button data-scene="reload_scenario">重载固定场景</button>
+            <button data-scene="reset_manual">清除 RViz 障碍物</button>
+            <button data-scene="clear_all">清除全部障碍物</button>
+          </div>
+          <p class="warning-line">RC 注入仅用于单次测试输入，不能替代遥控器接管验证。</p>
+        </div>
+
+        <div class="panel runtime-panel">
+          <div class="panel-heading"><h2>运行状态</h2><select id="logSelect" aria-label="日志来源"></select></div>
+          <div id="errorList" class="error-list"><div class="empty">未检测到运行错误</div></div>
+          <pre id="logOutput" class="log-output">等待进程输出</pre>
+        </div>
+
+        <div class="panel terminal-panel">
+          <div class="panel-heading"><h2>Orin 远程终端</h2><div class="terminal-actions"><button id="newTerminal">新建</button><button id="splitTerminalHorizontal">水平分割</button><button id="splitTerminalVertical">竖直分割</button></div></div>
+          <div id="terminalWorkspace" class="terminal-workspace"></div>
+          <p class="warning-line">每个窗格都是 Orin 上的独立 Bash PTY，拥有启动 App 的用户权限。该功能等同远程 shell，仅在隔离且受信任的现场网络使用。</p>
+        </div>
+      </section>
+
+      <aside class="settings-panel">
+        <div class="settings-heading"><h2>现场参数</h2><button id="saveConfig" class="primary">保存修改</button></div>
+        <form id="configForm">
+          <details open><summary>LiDAR 与场景</summary><div class="fieldset-body">
+            <label>PointCloud2 topic<input name="pointcloud_topic"></label>
+            <div class="two-col"><label>Livox workspace<input name="livox_workspace"></label><label>Livox launch<input name="livox_launch"></label></div>
+            <label>Livox xfer_format<select name="livox_xfer_format"><option value="2">2 · sensor_msgs/PointCloud2（控制栈需要）</option><option value="1">1 · livox_ros_driver2/CustomMsg（控制栈不可用）</option></select></label>
+            <p class="hint-line">选择 2 时，<span class="copy-on-select">/livox/lidar</span> 应为 <span class="copy-on-select">sensor_msgs/PointCloud2</span>；选择 1 时为 CustomMsg，不能供当前控制栈使用。修改后需停止并重新启动 Livox。</p>
+            <div class="two-col"><label>Frame<input name="pointcloud_frame"></label><label>Yaw offset (deg)<input name="sensor_yaw_offset_deg" type="number" step="0.1" readonly></label></div>
+            <label>场景 YAML<input name="scenario_yaml"></label>
+            <div class="two-col"><label>手动障碍半径 (m)<input name="manual_obstacle_radius" type="number" step="0.1"></label><label>Virtual target mode<select name="virtual_target_mode"><option value="1">1 · 固定速度</option><option value="3">3 · 距离等待</option></select></label></div>
+            <div class="three-col"><label>等待开始 (m)<input name="virtual_target_wait_dist_start" type="number" step="0.1"></label><label>完全停止 (m)<input name="virtual_target_wait_dist_stop" type="number" step="0.1"></label><label>目标速度 (m/s)<input name="virtual_target_speed" type="number" step="0.1"></label></div>
+            <label class="check"><input name="merge_physical_scan" type="checkbox">合并真实与虚拟扫描</label>
+            <label class="check"><input name="use_scenario_yaml" type="checkbox">启动时加载固定场景</label>
+          </div></details>
+
+          <details open><summary>Model 与 VecNormalize</summary><div class="fieldset-body">
+            <div class="path-toolbar"><label>搜索目录<input name="model_search_root"></label><button type="button" id="refreshModels">扫描</button></div>
+            <label>最近选择<select id="recentModel"><option value="">请选择</option></select></label>
+            <label>Model 文件<select id="modelCandidate"><option value="">从 runs/ 选择</option></select></label>
+            <label>VecNormalize 文件<select id="vecnormCandidate"><option value="">从 runs/ 选择</option></select></label>
+            <label>Model 相对路径<input name="model_path"></label>
+            <label>VecNormalize 相对路径<input name="vecnorm_path"></label>
+            <label>最大动作<input name="max_abs_action" type="number" step="0.01" max="0.1"></label>
+          </div></details>
+
+          <details><summary>MAVROS 与 RC</summary><div class="fieldset-body">
+            <label>FCU URL<input name="fcu_url"></label><label>GCS URL<input name="gcs_url"></label>
+            <label>UBlox 串口<input name="ublox_serial_port" placeholder="auto 或 /dev/ttyACM2"></label><label>RTCM TCP 主机<input name="ublox_rtcm_tcp_host"></label>
+            <p class="hint-line">默认 <span class="copy-on-select">auto</span> 会排除 FCU 串口并使用唯一可访问的 ACM/USB 设备；若检测到多个候选设备，请使用 udev 的稳定别名 <span class="copy-on-select">/dev/ublox</span>。</p>
+            <label>Odometry topic<input name="odom_topic"></label><label>RC input topic<input name="rc_in_topic"></label>
+            <div class="three-col"><label>ID 31 Hz<input name="rate_31" type="number"></label><label>ID 32 Hz<input name="rate_32" type="number"></label><label>ID 36 Hz<input name="rate_36" type="number"></label></div>
+            <div class="three-col"><label>主 index<input name="rc_unlock_channel" type="number" min="0" max="17"></label><label>备用 index<input name="rc_unlock_channel_backup" type="number" min="0" max="17"></label><label>阈值<input name="rc_unlock_threshold" type="number"></label></div>
+          </div></details>
+
+          <details open><summary>Recording</summary><div class="fieldset-body">
+            <label>Rosbag 目录<input name="bag_directory"></label>
+            <label>文件名前缀<input name="bag_session"></label>
+            <label>本次关键 tag<input name="bag_tags" placeholder="控制方式、模型、场景等"></label>
+            <div class="topic-toolbar"><label class="check"><input name="bag_record_all" type="checkbox">全部话题</label><div><button type="button" id="refreshBagTopics">刷新话题</button><button type="button" id="fetchTopicHz">获取频率</button></div></div>
+            <div class="topic-filter"><input type="text" id="topicFilter" placeholder="前缀筛选，如 /livox, /usv …" autocomplete="off"></div>
+            <div id="bagTopicList" class="topic-list" aria-label="Rosbag 话题选择"></div>
+            <p class="hint-line">ROS 进程由操作台直接托管，以确保状态栏与“停止”按钮准确反映并控制实际进程。</p>
+            <label class="check"><input name="open_process_terminals" type="checkbox">启动 ROS 命令时打开可见日志终端</label>
+            <p class="hint-line">终端实时显示对应日志；ROS 进程仍由操作台托管，关闭终端不会影响进程状态判断。</p>
+          </div></details>
+
+          <details><summary>执行器安全边界</summary><div class="fieldset-body safety-fieldset">
+            <label class="check"><input name="dry_run" type="checkbox">Dry run</label>
+            <label class="check"><input name="no_actuation" type="checkbox">禁止执行器输出</label>
+            <label>确认短语<input name="actuation_ack" placeholder="启用控制时填写"></label>
+          </div></details>
+        </form>
+      </aside>
+    </div>
+  </main>
+
+  <main id="visualizationView" class="app-view">
+    <section class="visualization-shell">
+      <div class="viz-toolbar">
+        <div><strong>Map 俯视图</strong><span id="vizConnection">等待 ROS 数据</span></div>
+        <div class="viz-actions"><button data-action="start_web_visualization">启动可视化</button><button data-action="stop_web_visualization">停止</button><button id="fitVisualization">适应内容</button><button id="poseEstimateMode">2D Pose Estimate</button><button id="navGoalMode">2D Nav Goal</button></div>
+      </div>
+      <div class="viz-stage"><canvas id="mapCanvas"></canvas><div id="vizHint" class="viz-hint">选择 2D Pose Estimate 或 2D Nav Goal，在地图上按下并拖动设置位置和航向</div></div>
+      <div class="viz-legend"><span class="pose-key">USV</span><span class="path-key">轨迹</span><span class="goal-key">目标/路线</span><span class="obstacle-key">障碍物/聚类</span></div>
+    </section>
+  </main>
+  <!-- UBlox 启动弹窗 -->
+  <div id="ublox-modal" class="ublox-modal-overlay" hidden>
+    <div class="ublox-modal">
+      <div class="ublox-modal-header">
+        <h3>启动 UBlox GNSS</h3>
+        <button class="ublox-modal-close" id="ublox-modal-close">&times;</button>
+      </div>
+      <div class="ublox-modal-body">
+        <div class="form-group">
+          <label for="ublox-serial-port">串口设备路径</label>
+          <input type="text" id="ublox-serial-port" placeholder="例如: /dev/ublox 或 auto">
+          <small>留空则使用配置中的默认值（当前: <span id="ublox-default-port">-</span>）</small>
+        </div>
+        <div class="form-group">
+          <label for="ublox-rtcm-host">RTCM TCP 地址</label>
+          <input type="text" id="ublox-rtcm-host" placeholder="例如: 192.168.1.100">
+          <small>留空则使用配置中的默认值（当前: <span id="ublox-default-rtcm">-</span>）</small>
+        </div>
+      </div>
+      <div class="ublox-modal-footer">
+        <button id="ublox-modal-cancel">取消</button>
+        <button class="primary" id="ublox-modal-confirm">确认启动</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Livox 点云格式选择弹窗 -->
+  <div id="lidar-modal" class="ublox-modal-overlay" hidden>
+    <div class="ublox-modal">
+      <div class="ublox-modal-header">
+        <h3>启动 Livox LiDAR</h3>
+        <button class="ublox-modal-close" id="lidar-modal-close">&times;</button>
+      </div>
+      <div class="ublox-modal-body">
+        <div class="form-group">
+          <label>点云话题类型 (xfer_format)</label>
+          <div class="radio-group">
+            <label class="radio-label">
+              <input type="radio" name="lidar-xfer" value="0">
+              <span>PointXYZRTLT (0)</span>
+            </label>
+            <label class="radio-label">
+              <input type="radio" name="lidar-xfer" value="1">
+              <span>CustomMsg (1)</span>
+            </label>
+            <label class="radio-label">
+              <input type="radio" name="lidar-xfer" value="2" checked>
+              <span>PointXYZI (2)</span>
+            </label>
+          </div>
+          <small>默认使用配置中的值（当前: <span id="lidar-default-xfer">2</span>）</small>
+        </div>
+      </div>
+      <div class="ublox-modal-footer">
+        <button id="lidar-modal-cancel">取消</button>
+        <button class="primary" id="lidar-modal-confirm">确认启动</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
